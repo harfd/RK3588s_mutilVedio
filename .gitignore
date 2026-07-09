@@ -1,0 +1,39 @@
+# Build outputs
+build/
+project2/build/
+project2/build_sip_deps/
+project2/MPP/build/
+
+# Compiled object files
+*.o
+*.lo
+*.la
+
+# Autotools generated
+libtool
+stamp-h1
+config.log
+config.status
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Dependencies / compiler temp
+.deps/
+.libs/
+*.depend
+
+# IDE
+.vscode/
+.agents/
+
+# Run artifacts
+output.ps
+*.h264
+*.mp4
+
+# OS
+.DS_Store
+Thumbs.db
