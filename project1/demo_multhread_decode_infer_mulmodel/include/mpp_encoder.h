@@ -34,6 +34,9 @@ public:
     // bgr_stride: 可选，BGR 行字节步长；0 表示 width*3
     int EncodeFrame(uint8_t* bgr_data, int width, int height, uint8_t* packet_data, int* packet_size, int bgr_stride = 0);
 
+    // 编码一帧 DMA/虚拟地址上的 BGR 图像，尽量减少拷贝
+    int EncodeFrameDma(void* bgr_va, int width, int height, uint8_t* packet_data, int* packet_size, int bgr_stride = 0);
+
     // 获取 SPS / PPS 等头信息（可用于 FFmpeg extradata）
     int GetHeader(uint8_t* header_data, int* header_size);
 
@@ -62,4 +65,3 @@ private:
 };
 
 #endif // MPP_ENCODER_H
-

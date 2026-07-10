@@ -16,6 +16,7 @@
 #include "streaming_manager.h"
 #include "detection_fusion_manager.h"
 #include "im2d.h"
+#include "include/dma_alloc.hpp"
 
 char *model_person = "../../model/person_relu.rknn";
 char *model_helmet = "../../model/helmet_relu.rknn";
@@ -44,6 +45,19 @@ void combineImage(StreamLoaderManager &manager)
     bool hasLastFrame = false;
     const int target_fps = 24; // 目标帧率
     const int frame_interval_ms = 1000 / target_fps; // 每帧间隔（毫秒）
+    const int tile_w = 640, tile_h = 360;
+    const size_t tile_size = static_cast<size_t>(tile_w) * tile_h * 3;
+    struct DmaTileBuffer {
+        int fd = -1;
+        void *va = nullptr;
+        cv::Mat view;
+    };
+    std::vector<DmaTileBuffer> tile_buffers(manager.num_stream);
+    for (int i = 0; i < manager.num_stream; ++i) {
+        if (dma_buf_alloc(DMA_HEAP_PATH, tile_size, &tile_buffers[i].fd, &tile_buffers[i].va) == 0) {
+            tile_buffers[i].view = cv::Mat(tile_h, tile_w, CV_8UC3, tile_buffers[i].va);
+        }
+    }
     auto last_frame_time = std::chrono::steady_clock::now();
     
     while (true)
@@ -51,7 +65,6 @@ void combineImage(StreamLoaderManager &manager)
         auto current_time = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_frame_time).count();
         
-        // 控制帧率：如果还没到时间，等待
         if (elapsed < frame_interval_ms) {
             std::this_thread::sleep_for(std::chrono::milliseconds(frame_interval_ms - elapsed));
             current_time = std::chrono::steady_clock::now();
@@ -59,7 +72,6 @@ void combineImage(StreamLoaderManager &manager)
         last_frame_time = current_time;
         
         bool hasNewFrame = false;
-        const int tile_w = 640, tile_h = 360;
 
         for (int i = 0; i < manager.num_stream; ++i)
         {
@@ -72,15 +84,20 @@ void combineImage(StreamLoaderManager &manager)
                 images[i] = cv::Mat();
             }
 
-            cv::Mat resizedImage(tile_h, tile_w, CV_8UC3);
+            cv::Mat resizedImage;
             int src_w = local_img.cols, src_h = local_img.rows;
 
-            rga_buffer_t src_buf = wrapbuffer_virtualaddr(local_img.data, src_w, src_h, RK_FORMAT_BGR_888);
-            rga_buffer_t dst_buf = wrapbuffer_virtualaddr(resizedImage.data, tile_w, tile_h, RK_FORMAT_BGR_888);
-
-            IM_STATUS status = imresize(src_buf, dst_buf);
-            if (status != IM_STATUS_SUCCESS) {
+            if (tile_buffers[i].va == nullptr) {
                 cv::resize(local_img, resizedImage, cv::Size(tile_w, tile_h));
+            } else {
+                rga_buffer_t src_buf = wrapbuffer_virtualaddr(local_img.data, src_w, src_h, RK_FORMAT_BGR_888);
+                rga_buffer_t dst_buf = wrapbuffer_virtualaddr(tile_buffers[i].va, tile_w, tile_h, RK_FORMAT_BGR_888);
+                IM_STATUS status = imresize(src_buf, dst_buf);
+                if (status != IM_STATUS_SUCCESS) {
+                    cv::resize(local_img, resizedImage, cv::Size(tile_w, tile_h));
+                } else {
+                    resizedImage = tile_buffers[i].view;
+                }
             }
 
             int row = i / 2, col = i % 2;
@@ -100,25 +117,22 @@ void combineImage(StreamLoaderManager &manager)
             frameToSend = combinedImage.clone();
         }
         
-        // 显示合成图像
-        //cv::imshow("Combined Image", frameToSend);
-        
-        // 发送到推流管理器
         StreamingData stream_data;
         stream_data.stream_id = 0;
         stream_data.frame = frameToSend;
+        stream_data.use_dma = false;
         stream_data.timestamp = std::chrono::system_clock::now();
-        // 初始化检测结果（如果需要绘制检测结果，需要从推理结果中获取）
         memset(&stream_data.person_results, 0, sizeof(detect_result_group_t));
         memset(&stream_data.helmet_results, 0, sizeof(detect_result_group_t));
         memset(&stream_data.tired_results, 0, sizeof(detect_result_group_t));
         memset(&stream_data.callplay_results, 0, sizeof(detect_result_group_t));
         
         streaming_manager.addStreamingData(stream_data);
-        
-        // 等待按键
-        //if (cv::waitKey(10) == 27)
-            //break;
+    }
+    for (auto &buf : tile_buffers) {
+        if (buf.fd >= 0) {
+            dma_buf_free(tile_size, &buf.fd, buf.va);
+        }
     }
     cv::destroyAllWindows(); // 销毁所有窗口
 }
@@ -185,7 +199,7 @@ int main(int argc, char *argv[])
     
     // 初始化推流配置
     StreamingConfig stream_config;
-    stream_config.rtmp_url = "rtmp://192.168.137.1/live/livestream"; // 替换为实际的RTMP地址
+    stream_config.rtmp_url = "rtmp://192.168.0.198/live/livestream"; // 替换为实际的RTMP地址
     stream_config.width = 1280;
     stream_config.height = 720;
     stream_config.fps = 24;
@@ -232,4 +246,3 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-

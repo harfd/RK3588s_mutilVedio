@@ -135,7 +135,6 @@ void StreamingManager::streamingWorker() {
             if (queue_cv_.wait_for(lock, timeout, [this] { 
                 return !streaming_queue_.empty() || should_stop_.load(); 
             })) {
-                // 有数据或需要停止
                 if (should_stop_.load()) {
                     break;
                 }
@@ -146,9 +145,7 @@ void StreamingManager::streamingWorker() {
                     got_data = true;
                 }
             } else {
-                // 超时，使用最后一帧或跳过
                 if (has_last_frame && !last_frame.empty()) {
-                    // 使用最后一帧保持连接活跃
                     data.frame = last_frame.clone();
                     data.stream_id = 0;
                     data.timestamp = std::chrono::system_clock::now();
@@ -158,7 +155,6 @@ void StreamingManager::streamingWorker() {
                     memset(&data.callplay_results, 0, sizeof(detect_result_group_t));
                     got_data = true;
                 } else {
-                    // 没有数据，继续等待
                     continue;
                 }
             }
@@ -168,24 +164,24 @@ void StreamingManager::streamingWorker() {
             continue;
         }
         
-        // 处理推流数据
-        cv::Mat frame = data.frame.clone();
-        
-        // 绘制检测结果
+        cv::Mat frame;
+        if (data.use_dma && data.frame_va && data.frame_width > 0 && data.frame_height > 0) {
+            frame = cv::Mat(data.frame_height, data.frame_width, CV_8UC3, data.frame_va, data.frame_stride > 0 ? data.frame_stride : data.frame_width * 3);
+        } else {
+            frame = data.frame.clone();
+        }
+
+        last_frame = frame.clone();
+        has_last_frame = true;
+
         if (config_.draw_detections) {
             drawDetections(frame, data);
         }
         
-        // 调整分辨率
         if (frame.cols != config_.width || frame.rows != config_.height) {
             cv::resize(frame, frame, cv::Size(config_.width, config_.height));
         }
         
-        // 保存当前帧作为最后一帧
-        last_frame = frame.clone();
-        has_last_frame = true;
-        
-        // 推流
         bool success = false;
         if (config_.enable_rtmp) {
             success |= sendRTMPFrame(frame);
@@ -217,7 +213,7 @@ void StreamingManager::streamingWorker() {
         }
         
         // 控制推流帧率
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000 / config_.fps));
+        //std::this_thread::sleep_for(std::chrono::milliseconds(1000 / config_.fps));
     }
 }
 

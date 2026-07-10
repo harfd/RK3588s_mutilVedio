@@ -19,6 +19,12 @@
 struct StreamingData {
     int stream_id;
     cv::Mat frame;
+    bool use_dma = false;
+    int frame_fd = -1;
+    void* frame_va = nullptr;
+    int frame_width = 0;
+    int frame_height = 0;
+    int frame_stride = 0;
     detect_result_group_t person_results;    // 人员检测结果
     detect_result_group_t helmet_results;   // 安全帽检测结果
     detect_result_group_t tired_results;    // 疲劳检测结果

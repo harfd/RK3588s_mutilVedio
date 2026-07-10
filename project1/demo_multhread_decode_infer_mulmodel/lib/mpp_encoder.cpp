@@ -161,6 +161,11 @@ FAIL:
 
 int MppEncoder::EncodeFrame(uint8_t* bgr_data, int width, int height,
                             uint8_t* packet_data, int* packet_size, int bgr_stride) {
+    return EncodeFrameDma((void*)bgr_data, width, height, packet_data, packet_size, bgr_stride);
+}
+
+int MppEncoder::EncodeFrameDma(void* bgr_va, int width, int height,
+                               uint8_t* packet_data, int* packet_size, int bgr_stride) {
     if (!initialized_) {
         fprintf(stderr, "Encoder not initialized\n");
         return -1;
@@ -177,24 +182,21 @@ int MppEncoder::EncodeFrame(uint8_t* bgr_data, int width, int height,
         return -1;
     }
 
-    // 使用 RGA 做 BGR -> YUV420P 转换（硬件加速）
-    // wstride/hstride 为像素 stride；BGR 每像素 3 字节，故 wstride_pix = byte_stride/3
     int wstride_pix = (bgr_stride > 0) ? (bgr_stride / 3) : width;
     int hstride_pix = height;
-    rga_buffer_t src_buf = wrapbuffer_virtualaddr_t((void*)bgr_data, width, height, wstride_pix, hstride_pix, RK_FORMAT_BGR_888);
+    rga_buffer_t src_buf = wrapbuffer_virtualaddr_t(bgr_va, width, height, wstride_pix, hstride_pix, RK_FORMAT_BGR_888);
     rga_buffer_t dst_buf = wrapbuffer_virtualaddr_t((void*)yuv_buffer_, width, height, width, height, RK_FORMAT_YCbCr_420_P);
 
     IM_STATUS status = imcvtcolor(src_buf, dst_buf,
                                   RK_FORMAT_BGR_888, RK_FORMAT_YCbCr_420_P,
                                   IM_COLOR_SPACE_DEFAULT);
     if (status != IM_STATUS_SUCCESS) {
-        // RGA 失败时回退到 OpenCV 软件转换（常见原因：虚拟地址 DMA 限制、驱动版本等）
         static int fallback_count = 0;
         if (fallback_count++ < 3) {
             fprintf(stderr, "RGA color conversion failed (%d), using OpenCV fallback\n", (int)status);
         }
         int row_stride = (bgr_stride > 0) ? bgr_stride : (width * 3);
-        cv::Mat bgr(height, width, CV_8UC3, bgr_data, row_stride);
+        cv::Mat bgr(height, width, CV_8UC3, bgr_va, row_stride);
         if (!bgr.isContinuous()) {
             bgr = bgr.clone();
         }
@@ -369,4 +371,3 @@ void MppEncoder::Release() {
 
     initialized_ = false;
 }
-
