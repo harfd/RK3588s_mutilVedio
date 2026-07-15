@@ -62,7 +62,7 @@ int MppDecoder::Init(int video_type, int fps, void *userdata,int id)
     memset(&loop_data, 0, sizeof(loop_data));
     // printf("mpi_dec_test decoder test start mpp_type %d ", mpp_type);
     MppDecCfg cfg = NULL;
-    MppCtx mpp_ctx = NULL;
+    mpp_ctx = NULL;
     mpp_mpi = NULL;
     ret = mpp_create(&mpp_ctx, &mpp_mpi);
     if (MPP_OK != ret)
