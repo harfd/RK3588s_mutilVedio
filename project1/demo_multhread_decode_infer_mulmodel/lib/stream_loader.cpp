@@ -9,8 +9,18 @@
 #include "stream_loader.h"
 #include "im2d.h"
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <thread>
+
+namespace
+{
+bool isV4L2DevicePath(const std::string &path)
+{
+    return path.rfind("/dev/v4l/", 0) == 0 ||
+           path.rfind("/dev/video", 0) == 0;
+}
+} // namespace
 
 // 判断是否为 Annex B 格式
 // 该函数并没有使用
@@ -86,6 +96,14 @@ void mpp_decoder_frame_callback(void *buffer, int width_stride, int height_strid
 
 void StreamLoader::close()
 {
+    if (is_v4l2_camera_)
+    {
+        std::lock_guard<std::mutex> lock(buffer.mtx);
+        buffer.img.release();
+        camera_.close();
+        return;
+    }
+
     decoder.Reset();
     if (temp_pkt)
     {
@@ -102,10 +120,23 @@ void StreamLoader::close()
     {
         avcodec_parameters_free(&codecPar); // 释放 codecPar 结构
     }
+
+    if (bsf_ctx)
+        av_bsf_free(&bsf_ctx);
+    av_dict_free(&options);
+    isnotAnnexB = false;
 }
 
 bool StreamLoader::read_frame()
 {
+    if (is_v4l2_camera_)
+    {
+        const bool ok = camera_.captureFrame(buffer, stopFlag);
+        if (!ok)
+            status = -1;
+        return ok;
+    }
+
     using namespace std::chrono_literals;
     int eof_retry = 0;           // 连续 av_read_frame 失败次数（EOF 时递增）
     int no_frame_count = 0;      // 已读视频包但解码未出帧的次数，防止异常时死循环
@@ -173,7 +204,7 @@ bool StreamLoader::read_frame()
     }
 }
 
-StreamLoader::StreamLoader(char *url, int id)
+StreamLoader::StreamLoader(const std::string &url, int id)
 {
     stream_loader_id = id;
     std::cout << "StreamLoader: " << std::to_string(id) << std::endl;
@@ -194,6 +225,23 @@ StreamLoader::~StreamLoader()
 
 int StreamLoader::open()
 {
+    is_v4l2_camera_ = isV4L2DevicePath(stream_url);
+    if (is_v4l2_camera_)
+    {
+        buffer.throttle = false;
+        buffer.frame_interval_ms = 0;
+        is_local_file_ = false;
+
+        const int ret = camera_.open(stream_url);
+        status = ret;
+        if (ret == 0)
+        {
+            width = camera_.sourceWidth();
+            height = camera_.sourceHeight();
+        }
+        return ret;
+    }
+
     temp_pkt = av_packet_alloc();
     // av_init_packet is deprecated in FFmpeg 7.x, av_packet_alloc() already initializes the packet
     codecPar = avcodec_parameters_alloc();
@@ -206,7 +254,7 @@ int StreamLoader::open()
     av_dict_set(&options, "max_delay", "500000", 0);
 
     // 打开RTSP流
-    if (avformat_open_input(&fmtCtx, stream_url, NULL, &options) != 0)
+    if (avformat_open_input(&fmtCtx, stream_url.c_str(), NULL, &options) != 0)
     {
         std::cout << "open rtsp stream failed" << std::endl;
         return -1;
@@ -218,7 +266,7 @@ int StreamLoader::open()
     }
 
     // 打印视频相关信息
-    av_dump_format(fmtCtx, 0, stream_url, 0);
+    av_dump_format(fmtCtx, 0, stream_url.c_str(), 0);
     // 获取视频的信息
     videoStreamIndex = -1;
     for (unsigned int i = 0; i < fmtCtx->nb_streams; i++)
@@ -295,18 +343,15 @@ int StreamLoader::open()
     if (fps <= 0) fps = 25.0;
     source_fps_ = fps;
 
-    is_local_file_ = false;
-    if (stream_url) {
-        std::string u(stream_url);
-        if (u.rfind("rtsp://", 0) != 0 && u.rfind("rtmp://", 0) != 0)
-            is_local_file_ = true;
-    }
+    is_local_file_ = stream_url.rfind("rtsp://", 0) != 0 &&
+                     stream_url.rfind("rtmp://", 0) != 0;
 
     if (is_local_file_ && source_fps_ > 0) {
         buffer.throttle = true;
         buffer.frame_interval_ms = (int)(1000.0 / source_fps_ * 1.2);
     }
 
+    status = 0;
     return 0;
 }
 
@@ -317,58 +362,41 @@ void StreamLoader::operator()()
     {
         try
         {
-            read_frame();
+            if (status == 0 && !read_frame() && status == 0)
+                status = -1;
         }
         catch (std::exception &e)
         {
             std::cout << "exception ............" << std::endl;
             std::cout << e.what() << std::endl;
+            status = -1;
         }
-        if (status)
+        if (status && !stopFlag)
         {
-            // status < 0 通常为 AVERROR_EOF（文件播完），触发 reconnect 实现循环播放
-            std::cout << "Stream " << stream_loader_id << " EOF, reconnecting..." << std::endl;
+            std::cout << "Stream " << stream_loader_id
+                      << " read failed, reopening..." << std::endl;
 
             // 先关闭当前流，清理解码器和 AVFormatContext
             close();
 
-            // 根据 URL 类型区分本地文件与网络流：
-            // - 本地文件：立即重新 open，相当于从头开始播放，实现循环播放
-            // - 网络流（rtsp/rtmp 等）：按原来的逻辑，失败时 10 秒后重试
-            bool is_network_stream = false;
-            if (stream_url)
+            // 网络流、相机和本地文件采用不同的重试间隔。
+            const bool is_network_stream =
+                stream_url.rfind("rtsp://", 0) == 0 ||
+                stream_url.rfind("rtmp://", 0) == 0;
+            const bool is_camera = isV4L2DevicePath(stream_url);
+            const int retry_ms = is_network_stream ? 10000 : (is_camera ? 1000 : 100);
+
+            while (!stopFlag && open() != 0)
             {
-                std::string url_str(stream_url);
-                if (url_str.rfind("rtsp://", 0) == 0 ||
-                    url_str.rfind("rtmp://", 0) == 0)
-                {
-                    is_network_stream = true;
-                }
+                std::cout << "Reopen failed, retry after " << retry_ms
+                          << " ms, id = " << stream_loader_id << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(retry_ms));
             }
 
-            if (is_network_stream)
-            {
-                // 原有 RTSP 重连逻辑：失败则 10s 后重试
-                while (open() != 0)
-                {
-                    std::cout << "Reconnect (network) failed, retry after 10s, id = "
-                              << stream_loader_id << std::endl;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10000));
-                }
-            }
-            else
-            {
-                // 本地文件：立即重新 open，相当于从头开始播放
-                // 如果打开失败，短暂等待后快速重试
-                while (open() != 0)
-                {
-                    std::cout << "Reopen local file failed, retry shortly, id = "
-                              << stream_loader_id << std::endl;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                std::cout << "Local file reopened, loop playback, id = "
-                          << stream_loader_id << std::endl;
-            }
+            if (stopFlag)
+                break;
+
+            std::cout << "Stream reopened, id = " << stream_loader_id << std::endl;
 
             // 重置状态，继续正常读取帧
             status = 0;
@@ -380,9 +408,12 @@ void StreamLoader::operator()()
 
 void StreamLoaderManager::load_stream(int id)
 {
+    if (id < 0 || static_cast<size_t>(id) >= urls.size())
+        throw std::out_of_range("stream id exceeds configured source count");
+
     std::cout << "Loading stream id: " << id << std::endl;
     StreamLoader *loader = new StreamLoader(urls[id], id);
-    loader->open();
+    loader->status = loader->open();
     stream_loaders.push_back(loader);
     threads.emplace_back(std::thread(std::ref(*loader)));
 }

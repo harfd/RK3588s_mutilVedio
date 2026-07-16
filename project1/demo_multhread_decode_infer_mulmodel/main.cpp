@@ -7,6 +7,7 @@
  * are strictly prohibited without prior written permission from the author.
  */
 
+#include <algorithm>
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -195,7 +196,30 @@ void rknn_infer(rknn_lite *p1, rknn_lite *p2, rknn_lite *p3, rknn_lite *p4, int 
 
 int main(int argc, char *argv[])
 {
-    manager.num_stream = std::stoi(argv[1]); // 获取输入视频流数量
+    if (argc != 2)
+    {
+        std::cerr << "Usage: " << argv[0] << " <stream_count>" << std::endl;
+        return -1;
+    }
+
+    try
+    {
+        manager.num_stream = std::stoi(argv[1]);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Invalid stream count: " << e.what() << std::endl;
+        return -1;
+    }
+
+    if (manager.num_stream < 1 ||
+        static_cast<size_t>(manager.num_stream) > manager.urls.size() ||
+        static_cast<size_t>(manager.num_stream) > images.size())
+    {
+        std::cerr << "stream_count must be between 1 and "
+                  << std::min(manager.urls.size(), images.size()) << std::endl;
+        return -1;
+    }
     
     // 初始化推流配置
     StreamingConfig stream_config;

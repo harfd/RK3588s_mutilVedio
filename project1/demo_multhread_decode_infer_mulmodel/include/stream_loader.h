@@ -18,6 +18,7 @@ extern "C"
 #include <libswscale/swscale.h>
 }
 #include "mpp_decoder.h"
+#include "v4l2_camera.h"
 #include <opencv2/opencv.hpp>
 #include <thread>
 #include <atomic>
@@ -26,6 +27,7 @@ extern "C"
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <string>
 using std::queue;
 using std::vector;
 #include "m_buffer.hpp"
@@ -39,24 +41,24 @@ class StreamLoader
 public:
     MppDecoder decoder;
     // 视频流的数据起始地址的索引
-    int videoStreamIndex;
+    int videoStreamIndex = -1;
     AVDictionary *options = NULL;
     AVFormatContext *fmtCtx = NULL;
     AVCodecParameters *codecPar = NULL;
 
     AVBSFContext *bsf_ctx = NULL;
-    const AVBitStreamFilter *bsf;
+    const AVBitStreamFilter *bsf = nullptr;
 
     // 是否已经读取到关键帧
     bool got_key_frame = false;
     // 存储接受流数据的临时结构，内存在构造函数中申请
-    AVPacket *temp_pkt;
+    AVPacket *temp_pkt = nullptr;
     // 当前包的编号
     int current_pkt_id = 0;
     // 当前对象的唯一标识号
     int stream_loader_id;
     // 流地址
-    char *stream_url = nullptr;
+    std::string stream_url;
     int width = 0;
     int height = 0;
     int status = 0;
@@ -71,10 +73,12 @@ public:
     // 本地文件播放时按源视频帧率限速，避免倍速
     double source_fps_ = 25.0;
     bool is_local_file_ = false;
+    bool is_v4l2_camera_ = false;
+    V4L2Camera camera_;
 
     void close();
     bool read_frame();
-    StreamLoader(char *url, int id);
+    StreamLoader(const std::string &url, int id);
     ~StreamLoader();
     int open();
     void operator()();
@@ -89,11 +93,12 @@ public:
     // char *url105 = "rtsp://admin:jhx12345@192.168.1.105:554/Streaming/Channels/101";
     // char *url104 = "rtsp://admin:jhx12345@192.168.1.104:554/Streaming/Channels/101";
     // vector<char *> urls = {url105, url104, url105, url104, url105, url104};
-    char* url1= "../../1.mp4";
-    char* url2= "../../2.mp4";
-    char* url3= "../../3.mp4";
-    char* url4= "../../4.mp4";
-    vector<char *> urls = {url1, url2, url3, url4, url2, url3};
+    std::string url1 = "../../1.mp4";
+    std::string url2 = "../../2.mp4";
+    std::string url3 = "../../3.mp4";
+    std::string url4 = "../../4.mp4";
+    std::string camera5 = "/dev/v4l/by-path/platform-rkisp1-vir0-video-index0";
+    vector<std::string> urls = {url1, url2, url3, url4, camera5, url3};
     int num_stream = 4;
     // -----------------------------------------------
     // 禁止拷贝构造和赋值操作
