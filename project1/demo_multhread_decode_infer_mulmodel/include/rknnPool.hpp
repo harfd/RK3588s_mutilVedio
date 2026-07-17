@@ -48,11 +48,11 @@ private:
 public:
     Mat ori_img;
     int interf(detect_result_group_t &detect_result_group);
-    rknn_lite(char *dst, int n, int class_num, int id);
+    rknn_lite(const char *dst, int n, int class_num, int id);
     ~rknn_lite();
 };
 
-rknn_lite::rknn_lite(char *model_name, int n, int class_num, int id)
+rknn_lite::rknn_lite(const char *model_name, int n, int class_num, int id)
 {
     this->class_num = class_num;
     this->id = id;

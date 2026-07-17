@@ -21,10 +21,10 @@
 #include "im2d.h"
 #include "include/dma_alloc.hpp"
 
-char *model_person = "../../model/person_relu.rknn";
-char *model_helmet = "../../model/helmet_relu.rknn";
+const char *model_person = "../../model/person_relu.rknn";
+const char *model_helmet = "../../model/helmet_relu.rknn";
 //char *model_tired = "../../model/tired_relu.rknn";
-char *model_callplay = "../../model/callplay_relu.rknn";
+const char *model_callplay = "../../model/callplay_relu.rknn";
 StreamLoaderManager &manager = StreamLoaderManager::getInstance();
 // 创建RKNN模型的集合，用于存储多个模型实例
 vector<rknn_lite *> rk_pool;
@@ -233,7 +233,8 @@ void combineImage(StreamLoaderManager &manager)
     }
     for (auto &buf : tile_buffers) {
         if (buf.fd >= 0) {
-            dma_buf_free(tile_size, &buf.fd, buf.va);
+            const size_t buffer_size = static_cast<size_t>(buf.width) * buf.height * 3;
+            dma_buf_free(buffer_size, &buf.fd, buf.va);
         }
     }
     cv::destroyAllWindows(); // 销毁所有窗口
