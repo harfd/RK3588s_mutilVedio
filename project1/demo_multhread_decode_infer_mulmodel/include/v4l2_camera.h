@@ -70,4 +70,6 @@ private:
     DmaBuffer output_bgr_;
     cv::Mat output_bgr_view_;
     bool output_cpu_access_active_ = false;
+    uint64_t captured_frame_count_ = 0;
+    uint32_t poll_timeout_count_ = 0;
 };

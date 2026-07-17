@@ -97,6 +97,7 @@ set(DEMO_LIB_SOURCES
     ${PROJECT_ROOT}/lib/mpp_decoder.cpp
     ${PROJECT_ROOT}/lib/mpp_encoder.cpp
     ${PROJECT_ROOT}/lib/postprocess.cpp
+    ${PROJECT_ROOT}/lib/realtime_logger.cpp
     ${PROJECT_ROOT}/lib/stream_loader.cpp
     ${PROJECT_ROOT}/lib/streaming_manager.cpp
     ${PROJECT_ROOT}/lib/v4l2_camera.cpp

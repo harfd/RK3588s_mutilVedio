@@ -16,6 +16,7 @@
 #include "rknnPool.hpp"
 #include "streaming_manager.h"
 #include "detection_fusion_manager.h"
+#include "realtime_logger.h"
 #include "im2d.h"
 #include "include/dma_alloc.hpp"
 
@@ -152,6 +153,8 @@ void rknn_infer(rknn_lite *p1, rknn_lite *p2, rknn_lite *p3, rknn_lite *p4, int 
     const int INFER_INTERVAL = 2; 
     int frame_count = 0;
     std::vector<FusedDetection> last_fused;
+    bool first_input_logged = false;
+    bool first_output_logged = false;
 
     while (!manager.stream_loaders[i]->stopFlag)
     {
@@ -167,6 +170,13 @@ void rknn_infer(rknn_lite *p1, rknn_lite *p2, rknn_lite *p3, rknn_lite *p4, int 
         if (p3) p3->ori_img = p1->ori_img;
         p4->ori_img = p1->ori_img;
         lock.unlock();
+
+        if (!first_input_logged)
+        {
+            std::cout << "Inference stream " << i << " received first frame: "
+                      << p1->ori_img.cols << "x" << p1->ori_img.rows << std::endl;
+            first_input_logged = true;
+        }
 
         frame_count++;
         bool do_infer = (frame_count % INFER_INTERVAL == 1) || last_fused.empty();
@@ -191,11 +201,23 @@ void rknn_infer(rknn_lite *p1, rknn_lite *p2, rknn_lite *p3, rknn_lite *p4, int 
         std::unique_lock<std::mutex> lockimage(mutexes[i]);
         images[i] = std::move(p1->ori_img);
         lockimage.unlock();
+
+        if (!first_output_logged)
+        {
+            std::cout << "Inference stream " << i
+                      << " published first frame to compositor" << std::endl;
+            first_output_logged = true;
+        }
     }
 }
 
 int main(int argc, char *argv[])
 {
+    RealtimeLogger realtime_logger;
+    if (!realtime_logger.start())
+        std::cerr << "Realtime file logging is unavailable; continuing with console output"
+                  << std::endl;
+
     if (argc != 2)
     {
         std::cerr << "Usage: " << argv[0] << " <stream_count>" << std::endl;

@@ -306,7 +306,16 @@ bool V4L2Camera::captureFrame(Mbuffer &output, const std::atomic<bool> &stop_fla
     if (stop_flag.load())
         return true;
     if (poll_ret == 0)
+    {
+        ++poll_timeout_count_;
+        if (poll_timeout_count_ % 5 == 0)
+        {
+            std::cerr << "V4L2 camera produced no frame for "
+                      << poll_timeout_count_ << " seconds: "
+                      << device_path_ << std::endl;
+        }
         return true;
+    }
     if (poll_ret < 0)
     {
         logErrno("poll camera", device_path_);
@@ -336,6 +345,7 @@ bool V4L2Camera::captureFrame(Mbuffer &output, const std::atomic<bool> &stop_fla
         logErrno("VIDIOC_DQBUF(DMABUF)", device_path_);
         return false;
     }
+    poll_timeout_count_ = 0;
 
     if (buffer.index >= capture_buffers_.size())
     {
@@ -345,6 +355,16 @@ bool V4L2Camera::captureFrame(Mbuffer &output, const std::atomic<bool> &stop_fla
 
     const bool processed = processBuffer(buffer.index, output);
     const int queue_ret = queueBuffer(buffer.index);
+    if (processed)
+    {
+        ++captured_frame_count_;
+        if (captured_frame_count_ == 1 || captured_frame_count_ % 100 == 0)
+        {
+            std::cout << "V4L2 camera frame " << captured_frame_count_
+                      << " processed by RGA, output="
+                      << kOutputWidth << "x" << kOutputHeight << std::endl;
+        }
+    }
     return processed && queue_ret == 0;
 }
 
@@ -453,4 +473,6 @@ void V4L2Camera::close()
     source_height_ = 0;
     source_stride_ = 0;
     source_size_ = 0;
+    captured_frame_count_ = 0;
+    poll_timeout_count_ = 0;
 }

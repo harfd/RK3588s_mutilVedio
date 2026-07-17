@@ -21,6 +21,36 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
+namespace
+{
+bool isH264IdrFrame(const uint8_t *data, size_t size)
+{
+    for (size_t i = 0; i + 3 < size;)
+    {
+        size_t start_code_size = 0;
+        if (data[i] == 0 && data[i + 1] == 0)
+        {
+            if (data[i + 2] == 1)
+                start_code_size = 3;
+            else if (i + 3 < size && data[i + 2] == 0 && data[i + 3] == 1)
+                start_code_size = 4;
+        }
+
+        if (start_code_size == 0)
+        {
+            ++i;
+            continue;
+        }
+
+        const size_t nal_offset = i + start_code_size;
+        if (nal_offset < size && (data[nal_offset] & 0x1f) == 5)
+            return true;
+        i = nal_offset + 1;
+    }
+    return false;
+}
+} // namespace
+
 StreamingManager::StreamingManager() 
     : streaming_active_(false)
     , should_stop_(false)
@@ -417,11 +447,15 @@ bool StreamingManager::sendRTMPFrame(const cv::Mat& frame) {
     }
 
     // 构造 AVPacket 并发送
-    AVPacket pkt;
+    AVPacket pkt = {};
     av_init_packet(&pkt);
     pkt.data = enc_buf.data();
     pkt.size = packet_size;
     pkt.stream_index = stream->index;
+    pkt.duration = 1;
+    pkt.pos = -1;
+    if (isH264IdrFrame(enc_buf.data(), packet_size))
+        pkt.flags |= AV_PKT_FLAG_KEY;
 
     // 简单的基于帧序号的 PTS
     pkt.pts = rtmp_frame_index_;
