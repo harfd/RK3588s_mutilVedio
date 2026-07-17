@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -40,24 +41,102 @@ StreamingManager streaming_manager;
 // 检测融合管理器
 DetectionFusionManager fusion_manager;
 
+namespace
+{
+constexpr int kCameraStreamId = 4;
+constexpr int kCompositeWidth = 1280;
+constexpr int kCompositeHeight = 1088;
+constexpr int kTileWidth = 640;
+constexpr int kTileHeight = 360;
+constexpr int kTileTopPadding = (kCompositeHeight - 3 * kTileHeight) / 2;
+constexpr int kLayoutStreamCount = 5;
+
+struct StreamLayout
+{
+    int x;
+    int y;
+    int width;
+    int height;
+};
+
+StreamLayout getStreamLayout(int stream_id)
+{
+    switch (stream_id)
+    {
+    case 0:
+        return {kTileWidth, kTileTopPadding, kTileWidth, kTileHeight};
+    case 1:
+        return {kTileWidth, kTileTopPadding + kTileHeight, kTileWidth, kTileHeight};
+    case 2:
+        return {0, kTileTopPadding + 2 * kTileHeight, kTileWidth, kTileHeight};
+    case 3:
+        return {kTileWidth, kTileTopPadding + 2 * kTileHeight, kTileWidth, kTileHeight};
+    case kCameraStreamId:
+        return {0, kTileTopPadding, kTileWidth, 2 * kTileHeight};
+    default:
+        return {0, 0, 0, 0};
+    }
+}
+
+cv::Mat centerCropToAspect(const cv::Mat &image, int target_width, int target_height)
+{
+    if (image.empty() || target_width <= 0 || target_height <= 0)
+        return image;
+
+    const int64_t source_aspect = static_cast<int64_t>(image.cols) * target_height;
+    const int64_t target_aspect = static_cast<int64_t>(image.rows) * target_width;
+    if (source_aspect == target_aspect)
+        return image;
+
+    int crop_width = image.cols;
+    int crop_height = image.rows;
+    if (source_aspect > target_aspect)
+        crop_width = static_cast<int>(static_cast<int64_t>(image.rows) * target_width / target_height);
+    else
+        crop_height = static_cast<int>(static_cast<int64_t>(image.cols) * target_height / target_width);
+
+    crop_width = std::max(2, crop_width & ~1);
+    crop_height = std::max(2, crop_height & ~1);
+    const int x = (image.cols - crop_width) / 2;
+    const int y = (image.rows - crop_height) / 2;
+    return image(cv::Rect(x, y, crop_width, crop_height));
+}
+
+void sharpenCameraTile(cv::Mat &image)
+{
+    if (image.empty())
+        return;
+
+    cv::Mat blurred;
+    cv::GaussianBlur(image, blurred, cv::Size(0, 0), 0.8, 0.8, cv::BORDER_REPLICATE);
+    cv::addWeighted(image, 1.2, blurred, -0.2, 0.0, image);
+}
+} // namespace
+
 void combineImage(StreamLoaderManager &manager)
 {
-    cv::Mat combinedImage(1080, 1280, CV_8UC3, cv::Scalar(0, 0, 0)); // 初始化为黑色
+    cv::Mat combinedImage(kCompositeHeight, kCompositeWidth,
+                          CV_8UC3, cv::Scalar(0, 0, 0)); // 初始化为黑色
     cv::Mat lastCombinedImage; // 保存最后一帧
     bool hasLastFrame = false;
     const int target_fps = 24; // 目标帧率
     const int frame_interval_ms = 1000 / target_fps; // 每帧间隔（毫秒）
-    const int tile_w = 640, tile_h = 360;
-    const size_t tile_size = static_cast<size_t>(tile_w) * tile_h * 3;
     struct DmaTileBuffer {
         int fd = -1;
         void *va = nullptr;
+        int width = 0;
+        int height = 0;
         cv::Mat view;
     };
     std::vector<DmaTileBuffer> tile_buffers(manager.num_stream);
     for (int i = 0; i < manager.num_stream; ++i) {
+        const StreamLayout layout = getStreamLayout(i);
+        tile_buffers[i].width = layout.width;
+        tile_buffers[i].height = layout.height;
+        const size_t tile_size = static_cast<size_t>(layout.width) * layout.height * 3;
         if (dma_buf_alloc(DMA_HEAP_PATH, tile_size, &tile_buffers[i].fd, &tile_buffers[i].va) == 0) {
-            tile_buffers[i].view = cv::Mat(tile_h, tile_w, CV_8UC3, tile_buffers[i].va);
+            tile_buffers[i].view = cv::Mat(layout.height, layout.width,
+                                           CV_8UC3, tile_buffers[i].va);
         }
     }
     auto last_frame_time = std::chrono::steady_clock::now();
@@ -86,25 +165,46 @@ void combineImage(StreamLoaderManager &manager)
                 images[i] = cv::Mat();
             }
 
+            const StreamLayout layout = getStreamLayout(i);
+            cv::Mat resize_source = local_img;
+            if (i == kCameraStreamId)
+                resize_source = centerCropToAspect(local_img, layout.width, layout.height);
+
             cv::Mat resizedImage;
-            int src_w = local_img.cols, src_h = local_img.rows;
+            int src_w = resize_source.cols, src_h = resize_source.rows;
+            bool tile_cpu_access_active = false;
 
             if (tile_buffers[i].va == nullptr) {
-                cv::resize(local_img, resizedImage, cv::Size(tile_w, tile_h));
+                cv::resize(resize_source, resizedImage,
+                           cv::Size(layout.width, layout.height),
+                           0.0, 0.0, cv::INTER_AREA);
             } else {
-                rga_buffer_t src_buf = wrapbuffer_virtualaddr(local_img.data, src_w, src_h, RK_FORMAT_BGR_888);
-                rga_buffer_t dst_buf = wrapbuffer_virtualaddr(tile_buffers[i].va, tile_w, tile_h, RK_FORMAT_BGR_888);
+                const int src_stride_pixels = static_cast<int>(resize_source.step / resize_source.elemSize());
+                rga_buffer_t src_buf = wrapbuffer_virtualaddr_t(
+                    resize_source.data, src_w, src_h,
+                    src_stride_pixels, src_h, RK_FORMAT_BGR_888);
+                rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
+                    tile_buffers[i].va, layout.width, layout.height,
+                    RK_FORMAT_BGR_888);
                 IM_STATUS status = imresize(src_buf, dst_buf);
-                if (status != IM_STATUS_SUCCESS) {
-                    cv::resize(local_img, resizedImage, cv::Size(tile_w, tile_h));
-                } else {
+                if (status == IM_STATUS_SUCCESS &&
+                    dma_sync_device_to_cpu(tile_buffers[i].fd) == 0) {
                     resizedImage = tile_buffers[i].view;
+                    tile_cpu_access_active = true;
+                } else {
+                    cv::resize(resize_source, resizedImage,
+                               cv::Size(layout.width, layout.height),
+                               0.0, 0.0, cv::INTER_AREA);
                 }
             }
 
-            int row = i / 2, col = i % 2;
-            int x = col * tile_w, y = row * tile_h;
-            resizedImage.copyTo(combinedImage(cv::Rect(x, y, tile_w, tile_h)));
+            if (i == kCameraStreamId)
+                sharpenCameraTile(resizedImage);
+
+            resizedImage.copyTo(combinedImage(cv::Rect(
+                layout.x, layout.y, layout.width, layout.height)));
+            if (tile_cpu_access_active)
+                dma_sync_cpu_to_device(tile_buffers[i].fd);
             hasNewFrame = true;
         }
 
@@ -234,22 +334,23 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    const size_t max_stream_count = std::min(
+        {manager.urls.size(), images.size(), static_cast<size_t>(kLayoutStreamCount)});
     if (manager.num_stream < 1 ||
-        static_cast<size_t>(manager.num_stream) > manager.urls.size() ||
-        static_cast<size_t>(manager.num_stream) > images.size())
+        static_cast<size_t>(manager.num_stream) > max_stream_count)
     {
         std::cerr << "stream_count must be between 1 and "
-                  << std::min(manager.urls.size(), images.size()) << std::endl;
+                  << max_stream_count << std::endl;
         return -1;
     }
     
     // 初始化推流配置
     StreamingConfig stream_config;
     stream_config.rtmp_url = "rtmp://192.168.0.198/live/livestream"; // 替换为实际的RTMP地址
-    stream_config.width = 1280;
-    stream_config.height = 720;
+    stream_config.width = kCompositeWidth;
+    stream_config.height = kCompositeHeight;
     stream_config.fps = 24;
-    stream_config.bitrate = 2000000;
+    stream_config.bitrate = 5000000;
     stream_config.enable_rtmp = true;
     stream_config.draw_detections = true;
     
