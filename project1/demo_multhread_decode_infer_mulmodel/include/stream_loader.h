@@ -60,7 +60,6 @@ public:
     int stream_loader_id;
     // 输入源配置
     StreamSourceConfig source_;
-    StreamSourceConfig source_;
     std::string stream_url_;
     int width = 0;
     int height = 0;
