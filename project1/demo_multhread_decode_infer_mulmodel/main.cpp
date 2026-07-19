@@ -1,4 +1,3 @@
-
 /*
  * Copyright (c) 2025-04-01 HeXiaotian
  *
@@ -8,42 +7,40 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
-#include <iostream>
-#include <cstring>
 #include <chrono>
+#include <cstring>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <mutex>
 #include <thread>
-#include "stream_loader.h"
-#include "rknnPool.hpp"
-#include "streaming_manager.h"
+#include <vector>
+
+#include "app_config.h"
 #include "detection_fusion_manager.h"
 #include "realtime_logger.h"
 #include "im2d.h"
 #include "include/dma_alloc.hpp"
+#include "rknnPool.hpp"
+#include "stream_loader.h"
+#include "streaming_manager.h"
 
-const char *model_person = "../../model/person_relu.rknn";
-const char *model_helmet = "../../model/helmet_relu.rknn";
-//char *model_tired = "../../model/tired_relu.rknn";
-const char *model_callplay = "../../model/callplay_relu.rknn";
-StreamLoaderManager &manager = StreamLoaderManager::getInstance();
-// 创建RKNN模型的集合，用于存储多个模型实例
-vector<rknn_lite *> rk_pool;
-// 创建线程池对象，使用n个线程
-vector<std::thread> rk_threads;
-// 用于存储显示图像的Mat
-vector<cv::Mat> images(6);
-// 管理images的互斥锁
-vector<std::mutex> mutexes(6);
+#ifndef APP_CONFIG_FILE
+#error "APP_CONFIG_FILE must point to demo_multhread_decode_infer_mulmodel/config_user.ini"
+#endif
 
-// 推流管理器
+StreamLoaderManager& manager = StreamLoaderManager::getInstance();
+std::vector<std::unique_ptr<rknn_lite>> rk_pool;
+std::vector<std::thread> rk_threads;
+std::vector<cv::Mat> images(6);
+std::vector<std::mutex> mutexes(6);
 StreamingManager streaming_manager;
-
-// 检测融合管理器
 DetectionFusionManager fusion_manager;
 
 namespace
 {
-constexpr int kCameraStreamId = 4;
 constexpr int kCompositeWidth = 1280;
 constexpr int kCompositeHeight = 1088;
 constexpr int kTileWidth = 640;
@@ -59,9 +56,24 @@ struct StreamLayout
     int height;
 };
 
-StreamLayout getStreamLayout(int stream_id)
+StreamLayout getStreamLayout(int stream_id, int camera_stream_index)
 {
-    switch (stream_id)
+    if (stream_id == camera_stream_index)
+        return {0, kTileTopPadding, kTileWidth, 2 * kTileHeight};
+
+    if (camera_stream_index < 0)
+    {
+        const int row = stream_id / 2;
+        const int column = stream_id % 2;
+        return {column * kTileWidth,
+                kTileTopPadding + row * kTileHeight,
+                kTileWidth, kTileHeight};
+    }
+
+    const int thumbnail_index = stream_id < camera_stream_index
+                                    ? stream_id
+                                    : stream_id - 1;
+    switch (thumbnail_index)
     {
     case 0:
         return {kTileWidth, kTileTopPadding, kTileWidth, kTileHeight};
@@ -71,11 +83,19 @@ StreamLayout getStreamLayout(int stream_id)
         return {0, kTileTopPadding + 2 * kTileHeight, kTileWidth, kTileHeight};
     case 3:
         return {kTileWidth, kTileTopPadding + 2 * kTileHeight, kTileWidth, kTileHeight};
-    case kCameraStreamId:
-        return {0, kTileTopPadding, kTileWidth, 2 * kTileHeight};
     default:
         return {0, 0, 0, 0};
     }
+}
+
+int findCameraStreamIndex(const std::vector<StreamSourceConfig>& sources)
+{
+    for (size_t i = 0; i < sources.size(); ++i)
+    {
+        if (sources[i].type == InputSourceType::Camera)
+            return static_cast<int>(i);
+    }
+    return -1;
 }
 
 cv::Mat centerCropToAspect(const cv::Mat &image, int target_width, int target_height)
@@ -113,14 +133,14 @@ void sharpenCameraTile(cv::Mat &image)
 }
 } // namespace
 
-void combineImage(StreamLoaderManager &manager)
+void combineImage(StreamLoaderManager& stream_manager, int target_fps,
+                  bool streaming_enabled, int camera_stream_index)
 {
-    cv::Mat combinedImage(kCompositeHeight, kCompositeWidth,
-                          CV_8UC3, cv::Scalar(0, 0, 0)); // 初始化为黑色
-    cv::Mat lastCombinedImage; // 保存最后一帧
-    bool hasLastFrame = false;
-    const int target_fps = 24; // 目标帧率
-    const int frame_interval_ms = 1000 / target_fps; // 每帧间隔（毫秒）
+    cv::Mat combined_image(kCompositeHeight, kCompositeWidth,
+                           CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat last_combined_image;
+    bool has_last_frame = false;
+    const int frame_interval_ms = 1000 / target_fps;
     struct DmaTileBuffer {
         int fd = -1;
         void *va = nullptr;
@@ -128,9 +148,9 @@ void combineImage(StreamLoaderManager &manager)
         int height = 0;
         cv::Mat view;
     };
-    std::vector<DmaTileBuffer> tile_buffers(manager.num_stream);
-    for (int i = 0; i < manager.num_stream; ++i) {
-        const StreamLayout layout = getStreamLayout(i);
+    std::vector<DmaTileBuffer> tile_buffers(stream_manager.num_stream);
+    for (int i = 0; i < stream_manager.num_stream; ++i) {
+        const StreamLayout layout = getStreamLayout(i, camera_stream_index);
         tile_buffers[i].width = layout.width;
         tile_buffers[i].height = layout.height;
         const size_t tile_size = static_cast<size_t>(layout.width) * layout.height * 3;
@@ -139,43 +159,44 @@ void combineImage(StreamLoaderManager &manager)
                                            CV_8UC3, tile_buffers[i].va);
         }
     }
+
     auto last_frame_time = std::chrono::steady_clock::now();
-    
-    while (true)
-    {
+    while (true) {
         auto current_time = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_frame_time).count();
-        
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                current_time - last_frame_time)
+                .count();
         if (elapsed < frame_interval_ms) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(frame_interval_ms - elapsed));
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(frame_interval_ms - elapsed));
             current_time = std::chrono::steady_clock::now();
         }
         last_frame_time = current_time;
-        
-        bool hasNewFrame = false;
 
-        for (int i = 0; i < manager.num_stream; ++i)
-        {
-            cv::Mat local_img;
+        bool has_new_frame = false;
+        for (int i = 0; i < stream_manager.num_stream; ++i) {
+            cv::Mat local_image;
             {
                 std::lock_guard<std::mutex> lock(mutexes[i]);
-                if (images[i].empty())
+                if (images[i].empty()) {
                     continue;
-                local_img = std::move(images[i]);
+                }
+                local_image = std::move(images[i]);
                 images[i] = cv::Mat();
             }
 
-            const StreamLayout layout = getStreamLayout(i);
-            cv::Mat resize_source = local_img;
-            if (i == kCameraStreamId)
-                resize_source = centerCropToAspect(local_img, layout.width, layout.height);
+            const StreamLayout layout = getStreamLayout(i, camera_stream_index);
+            cv::Mat resize_source = local_image;
+            if (i == camera_stream_index)
+                resize_source = centerCropToAspect(local_image, layout.width, layout.height);
 
-            cv::Mat resizedImage;
+            cv::Mat resized_image;
             int src_w = resize_source.cols, src_h = resize_source.rows;
             bool tile_cpu_access_active = false;
 
             if (tile_buffers[i].va == nullptr) {
-                cv::resize(resize_source, resizedImage,
+                cv::resize(resize_source, resized_image,
                            cv::Size(layout.width, layout.height),
                            0.0, 0.0, cv::INTER_AREA);
             } else {
@@ -189,208 +210,303 @@ void combineImage(StreamLoaderManager &manager)
                 IM_STATUS status = imresize(src_buf, dst_buf);
                 if (status == IM_STATUS_SUCCESS &&
                     dma_sync_device_to_cpu(tile_buffers[i].fd) == 0) {
-                    resizedImage = tile_buffers[i].view;
+                    resized_image = tile_buffers[i].view;
                     tile_cpu_access_active = true;
                 } else {
-                    cv::resize(resize_source, resizedImage,
+                    cv::resize(resize_source, resized_image,
                                cv::Size(layout.width, layout.height),
                                0.0, 0.0, cv::INTER_AREA);
                 }
             }
 
-            if (i == kCameraStreamId)
-                sharpenCameraTile(resizedImage);
+            if (i == camera_stream_index)
+                sharpenCameraTile(resized_image);
 
-            resizedImage.copyTo(combinedImage(cv::Rect(
+            resized_image.copyTo(combined_image(cv::Rect(
                 layout.x, layout.y, layout.width, layout.height)));
             if (tile_cpu_access_active)
                 dma_sync_cpu_to_device(tile_buffers[i].fd);
-            hasNewFrame = true;
+            has_new_frame = true;
         }
 
-        cv::Mat frameToSend;
-        if (hasNewFrame) {
-            lastCombinedImage = combinedImage.clone();
-            frameToSend = lastCombinedImage;
-            hasLastFrame = true;
-        } else if (hasLastFrame) {
-            frameToSend = lastCombinedImage;
+        cv::Mat frame_to_send;
+        if (has_new_frame) {
+            last_combined_image = combined_image.clone();
+            frame_to_send = last_combined_image;
+            has_last_frame = true;
+        } else if (has_last_frame) {
+            frame_to_send = last_combined_image;
         } else {
-            frameToSend = combinedImage.clone();
+            frame_to_send = combined_image.clone();
         }
-        
-        StreamingData stream_data;
-        stream_data.stream_id = 0;
-        stream_data.frame = frameToSend;
-        stream_data.use_dma = false;
-        stream_data.timestamp = std::chrono::system_clock::now();
-        memset(&stream_data.person_results, 0, sizeof(detect_result_group_t));
-        memset(&stream_data.helmet_results, 0, sizeof(detect_result_group_t));
-        memset(&stream_data.tired_results, 0, sizeof(detect_result_group_t));
-        memset(&stream_data.callplay_results, 0, sizeof(detect_result_group_t));
-        
-        streaming_manager.addStreamingData(stream_data);
-    }
-    for (auto &buf : tile_buffers) {
-        if (buf.fd >= 0) {
-            const size_t buffer_size = static_cast<size_t>(buf.width) * buf.height * 3;
-            dma_buf_free(buffer_size, &buf.fd, buf.va);
+        if (streaming_enabled) {
+            StreamingData stream_data;
+            stream_data.stream_id = 0;
+            stream_data.frame = frame_to_send;
+            stream_data.use_dma = false;
+            stream_data.timestamp = std::chrono::system_clock::now();
+            memset(&stream_data.person_results, 0,
+                   sizeof(detect_result_group_t));
+            memset(&stream_data.helmet_results, 0,
+                   sizeof(detect_result_group_t));
+            memset(&stream_data.tired_results, 0,
+                   sizeof(detect_result_group_t));
+            memset(&stream_data.callplay_results, 0,
+                   sizeof(detect_result_group_t));
+            streaming_manager.addStreamingData(stream_data);
         }
     }
-    cv::destroyAllWindows(); // 销毁所有窗口
+
+    for (auto& buffer : tile_buffers) {
+        if (buffer.fd >= 0) {
+            const size_t buffer_size =
+                static_cast<size_t>(buffer.width) * buffer.height * 3;
+            dma_buf_free(buffer_size, &buffer.fd, buffer.va);
+        }
+    }
 }
 
-void rknn_infer(rknn_lite *p1, rknn_lite *p2, rknn_lite *p3, rknn_lite *p4, int i)
+void rknn_infer(rknn_lite* person, rknn_lite* helmet, rknn_lite* tired,
+                rknn_lite* callplay, int stream_index, int infer_interval,
+                bool draw_detections)
 {
     dpool::ThreadPool pool(4);
+    detect_result_group_t person_results;
+    detect_result_group_t helmet_results;
+    detect_result_group_t tired_results;
+    detect_result_group_t callplay_results;
+    memset(&person_results, 0, sizeof(detect_result_group_t));
+    memset(&helmet_results, 0, sizeof(detect_result_group_t));
+    memset(&tired_results, 0, sizeof(detect_result_group_t));
+    memset(&callplay_results, 0, sizeof(detect_result_group_t));
 
-    detect_result_group_t g1, g2, g3, g4;
-    memset(&g1, 0, sizeof(detect_result_group_t));
-    memset(&g2, 0, sizeof(detect_result_group_t));
-    memset(&g3, 0, sizeof(detect_result_group_t));
-    memset(&g4, 0, sizeof(detect_result_group_t));
-
-    // 跳帧推理：每 INFER_INTERVAL 帧做一次完整推理，中间帧复用上一帧检测结果，提高实时性
-    const int INFER_INTERVAL = 2; 
     int frame_count = 0;
+    bool has_inference_result = false;
     std::vector<FusedDetection> last_fused;
     bool first_input_logged = false;
     bool first_output_logged = false;
 
-    while (!manager.stream_loaders[i]->stopFlag)
-    {
-        std::unique_lock<std::mutex> lock(manager.stream_loaders[i]->buffer.mtx);
-        if (manager.stream_loaders[i]->buffer.img.empty())
-        {
+    while (!manager.stream_loaders[stream_index]->stopFlag) {
+        std::unique_lock<std::mutex> lock(
+            manager.stream_loaders[stream_index]->buffer.mtx);
+        if (manager.stream_loaders[stream_index]->buffer.img.empty()) {
             lock.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
-        p1->ori_img = manager.stream_loaders[i]->buffer.img.clone();
-        p2->ori_img = p1->ori_img;
-        if (p3) p3->ori_img = p1->ori_img;
-        p4->ori_img = p1->ori_img;
+        person->ori_img =
+            manager.stream_loaders[stream_index]->buffer.img.clone();
+        helmet->ori_img = person->ori_img.clone();
+        if (tired) {
+            tired->ori_img = person->ori_img.clone();
+        }
+        callplay->ori_img = person->ori_img.clone();
         lock.unlock();
 
         if (!first_input_logged)
         {
-            std::cout << "Inference stream " << i << " received first frame: "
-                      << p1->ori_img.cols << "x" << p1->ori_img.rows << std::endl;
+            std::cout << "Inference stream " << stream_index
+                      << " received first frame: "
+                      << person->ori_img.cols << "x" << person->ori_img.rows
+                      << std::endl;
             first_input_logged = true;
         }
 
-        frame_count++;
-        bool do_infer = (frame_count % INFER_INTERVAL == 1) || last_fused.empty();
+        ++frame_count;
+        const bool do_infer =
+            !has_inference_result ||
+            ((frame_count - 1) % infer_interval == 0);
+        if (do_infer) {
+            memset(&person_results, 0, sizeof(detect_result_group_t));
+            memset(&helmet_results, 0, sizeof(detect_result_group_t));
+            memset(&tired_results, 0, sizeof(detect_result_group_t));
+            memset(&callplay_results, 0, sizeof(detect_result_group_t));
 
-        if (do_infer)
-        {
-            auto f1 = pool.submit([&]() { p1->interf(g1); });
-            auto f2 = pool.submit([&]() { p2->interf(g2); });
-            std::future<void> f3;
-            if (p3) f3 = pool.submit([&]() { p3->interf(g3); });
-            auto f4 = pool.submit([&]() { p4->interf(g4); });
+            auto person_future =
+                pool.submit([&]() { person->interf(person_results); });
+            auto helmet_future =
+                pool.submit([&]() { helmet->interf(helmet_results); });
+            std::future<void> tired_future;
+            if (tired) {
+                tired_future =
+                    pool.submit([&]() { tired->interf(tired_results); });
+            }
+            auto callplay_future =
+                pool.submit([&]() { callplay->interf(callplay_results); });
 
-            f1.get(); f2.get();
-            if (p3) f3.get();
-            f4.get();
+            person_future.get();
+            helmet_future.get();
+            if (tired) {
+                tired_future.get();
+            }
+            callplay_future.get();
 
-            last_fused = fusion_manager.fuseDetections(g1, g2, g3, g4);
+            last_fused = fusion_manager.fuseDetections(
+                person_results, helmet_results, tired_results,
+                callplay_results);
+            has_inference_result = true;
         }
 
-        fusion_manager.drawFusedDetections(p1->ori_img, last_fused);
-
-        std::unique_lock<std::mutex> lockimage(mutexes[i]);
-        images[i] = std::move(p1->ori_img);
-        lockimage.unlock();
+        if (draw_detections) {
+            fusion_manager.drawFusedDetections(person->ori_img, last_fused);
+        }
+        {
+            std::lock_guard<std::mutex> image_lock(mutexes[stream_index]);
+            images[stream_index] = std::move(person->ori_img);
+        }
 
         if (!first_output_logged)
         {
-            std::cout << "Inference stream " << i
+            std::cout << "Inference stream " << stream_index
                       << " published first frame to compositor" << std::endl;
             first_output_logged = true;
         }
     }
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     RealtimeLogger realtime_logger;
     if (!realtime_logger.start())
         std::cerr << "Realtime file logging is unavailable; continuing with console output"
                   << std::endl;
 
-    if (argc != 2)
+    if (argc > 2)
     {
-        std::cerr << "Usage: " << argv[0] << " <stream_count>" << std::endl;
+        std::cerr << "Usage: " << argv[0]
+                  << " [config_file|stream_count]" << std::endl;
         return -1;
     }
 
-    try
+    std::string config_path = APP_CONFIG_FILE;
+    int stream_count_override = -1;
+    if (argc == 2)
     {
-        manager.num_stream = std::stoi(argv[1]);
+        const std::string argument = argv[1];
+        const bool is_number = !argument.empty() &&
+            std::all_of(argument.begin(), argument.end(),
+                        [](unsigned char ch) { return std::isdigit(ch) != 0; });
+        if (is_number)
+            stream_count_override = std::stoi(argument);
+        else
+            config_path = argument;
     }
-    catch (const std::exception &e)
+
+    AppConfig app_config;
+    std::string config_error;
+    if (!AppConfigLoader::load(config_path, app_config, config_error)) {
+        std::cerr << "Failed to load " << config_path << ": "
+                  << config_error << std::endl;
+        return -1;
+    }
+    if (stream_count_override > 0)
     {
-        std::cerr << "Invalid stream count: " << e.what() << std::endl;
+        if (stream_count_override > static_cast<int>(app_config.streams.size()))
+        {
+            std::cerr << "stream_count override exceeds enabled sources in config"
+                      << std::endl;
+            return -1;
+        }
+        app_config.streams.resize(stream_count_override);
+    }
+    if (app_config.streams.empty() ||
+        app_config.streams.size() > static_cast<size_t>(kLayoutStreamCount) ||
+        app_config.streams.size() > images.size())
+    {
+        std::cerr << "configured stream count must be between 1 and "
+                  << kLayoutStreamCount << std::endl;
         return -1;
     }
 
-    const size_t max_stream_count = std::min(
-        {manager.urls.size(), images.size(), static_cast<size_t>(kLayoutStreamCount)});
-    if (manager.num_stream < 1 ||
-        static_cast<size_t>(manager.num_stream) > max_stream_count)
-    {
-        std::cerr << "stream_count must be between 1 and "
-                  << max_stream_count << std::endl;
-        return -1;
-    }
-    
-    // 初始化推流配置
+    std::cout << "Loaded configuration: " << config_path << std::endl;
+    manager.configure(app_config.streams);
+    const int camera_stream_index = findCameraStreamIndex(app_config.streams);
+
+    FusionConfig fusion_config;
+    fusion_config.iou_threshold =
+        app_config.inference.fusion_iou_threshold;
+    fusion_config.iom_threshold =
+        app_config.inference.fusion_iom_threshold;
+    fusion_config.confidence_threshold =
+        app_config.inference.fusion_confidence_threshold;
+    fusion_manager.setConfig(fusion_config);
+
     StreamingConfig stream_config;
-    stream_config.rtmp_url = "rtmp://192.168.0.198/live/livestream"; // 替换为实际的RTMP地址
-    stream_config.width = kCompositeWidth;
-    stream_config.height = kCompositeHeight;
-    stream_config.fps = 24;
-    stream_config.bitrate = 5000000;
-    stream_config.enable_rtmp = true;
-    stream_config.draw_detections = true;
-    
-    // 初始化推流管理器
-    if (!streaming_manager.initialize(stream_config)) {
+    stream_config.rtmp_url = app_config.streaming.rtmp_url;
+    stream_config.rtsp_url = app_config.streaming.rtsp_url;
+    stream_config.width = app_config.streaming.width;
+    stream_config.height = app_config.streaming.height;
+    stream_config.fps = app_config.streaming.fps;
+    stream_config.bitrate = app_config.streaming.bitrate;
+    stream_config.enable_rtmp = app_config.streaming.enable_rtmp;
+    stream_config.enable_rtsp = app_config.streaming.enable_rtsp;
+    stream_config.draw_detections = app_config.streaming.draw_detections;
+    const bool streaming_enabled =
+        stream_config.enable_rtmp || stream_config.enable_rtsp;
+
+    if (streaming_enabled &&
+        !streaming_manager.initialize(stream_config)) {
         std::cerr << "Failed to initialize streaming manager" << std::endl;
         return -1;
     }
-    
-    // 启动推流
-    streaming_manager.startStreaming();
-    
-    // 解码与推理线程
-    for (int i = 0; i < manager.num_stream; ++i)
-    {
-        manager.load_stream(i);
-        // 不同模型绑定不同 NPU 核心，使 ThreadPool 内 person/helmet/callplay 可并行推理
-        rknn_lite *ptr1 = new rknn_lite(model_person, 0, 1, 0);
-        rknn_lite *ptr2 = new rknn_lite(model_helmet, 1, 2, 1);
-        rknn_lite *ptr3 = nullptr;
-        rknn_lite *ptr4 = new rknn_lite(model_callplay, 2, 2, 3);
-        rk_threads.push_back(std::thread(rknn_infer, ptr1, ptr2, ptr3, ptr4, i));
+    if (streaming_enabled) {
+        streaming_manager.startStreaming();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    std::thread readerThread(combineImage, std::ref(manager));
-    readerThread.join();
 
-    // 停止推流
-    streaming_manager.stopStreaming();
-    
-    for (int i = 0; i < manager.num_stream; ++i)
-    {
+    for (int i = 0; i < manager.num_stream; ++i) {
+        if (!manager.load_stream(i)) {
+            std::cerr << "Failed to load stream " << i << std::endl;
+            return -1;
+        }
+
+        auto person = std::make_unique<rknn_lite>(
+            app_config.inference.person_model_path,
+            app_config.inference.person_core,
+            app_config.inference.person_class_count, 0,
+            app_config.inference.confidence_threshold,
+            app_config.inference.nms_threshold);
+        auto helmet = std::make_unique<rknn_lite>(
+            app_config.inference.helmet_model_path,
+            app_config.inference.helmet_core,
+            app_config.inference.helmet_class_count, 1,
+            app_config.inference.confidence_threshold,
+            app_config.inference.nms_threshold);
+        auto callplay = std::make_unique<rknn_lite>(
+            app_config.inference.callplay_model_path,
+            app_config.inference.callplay_core,
+            app_config.inference.callplay_class_count, 3,
+            app_config.inference.confidence_threshold,
+            app_config.inference.nms_threshold);
+
+        rknn_lite* person_ptr = person.get();
+        rknn_lite* helmet_ptr = helmet.get();
+        rknn_lite* callplay_ptr = callplay.get();
+        rk_pool.push_back(std::move(person));
+        rk_pool.push_back(std::move(helmet));
+        rk_pool.push_back(std::move(callplay));
+        rk_threads.emplace_back(
+            rknn_infer, person_ptr, helmet_ptr, nullptr, callplay_ptr, i,
+            app_config.global.infer_interval,
+            app_config.streaming.draw_detections);
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::thread reader_thread(combineImage, std::ref(manager),
+                              stream_config.fps, streaming_enabled,
+                              camera_stream_index);
+    reader_thread.join();
+
+    if (streaming_enabled) {
+        streaming_manager.stopStreaming();
+    }
+    for (int i = 0; i < manager.num_stream; ++i) {
         manager.unload_stream(i);
     }
-    for (auto &t : rk_threads)
-    {
-        if (t.joinable())
-            t.join();
+    for (auto& thread : rk_threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
     }
-
+    rk_pool.clear();
     return 0;
 }

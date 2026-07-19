@@ -12,6 +12,7 @@
 #include <queue>
 #include <vector>
 #include <iostream>
+#include <string>
 #include "rga.h"
 #include "im2d.h"
 #include "RgaUtils.h"
@@ -31,8 +32,8 @@ static unsigned char *load_model(const char *filename, int *model_size);
 class rknn_lite
 {
 private:
-    rknn_context rkModel;
-    unsigned char *model_data;
+    rknn_context rkModel = 0;
+    unsigned char *model_data = nullptr;
     rknn_sdk_version version;
     rknn_input_output_num io_num;
     rknn_tensor_attr *input_attrs;
@@ -43,24 +44,33 @@ private:
     int width = 0;
     int height = 0;
     int class_num = 0;
-    int id;
+    float box_conf_threshold_ = BOX_THRESH;
+    float nms_threshold_ = NMS_THRESH;
 
 public:
     Mat ori_img;
     int interf(detect_result_group_t &detect_result_group);
-    rknn_lite(const char *dst, int n, int class_num, int id);
+    rknn_lite(const std::string& model_name, int n, int class_num, int id,
+              float box_conf_threshold, float nms_threshold);
     ~rknn_lite();
 };
 
-rknn_lite::rknn_lite(const char *model_name, int n, int class_num, int id)
+rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
+                     int id, float box_conf_threshold, float nms_threshold)
 {
     this->class_num = class_num;
-    this->id = id;
+    box_conf_threshold_ = box_conf_threshold;
+    nms_threshold_ = nms_threshold;
     /* Create the neural network */
     printf("Loading model id = %d\n", id);
     int model_data_size = 0;
     // 读取模型文件数据
-    model_data = load_model(model_name, &model_data_size);
+    model_data = load_model(model_name.c_str(), &model_data_size);
+    if (!model_data || model_data_size <= 0)
+    {
+        fprintf(stderr, "Failed to load RKNN model: %s\n", model_name.c_str());
+        exit(-1);
+    }
     // 通过模型文件初始化rknn类
     ret = rknn_init(&rkModel, model_data, model_data_size, 0, NULL);
     if (ret < 0)
@@ -100,7 +110,7 @@ rknn_lite::rknn_lite(const char *model_name, int n, int class_num, int id)
 
     // 设置输入数组
     input_attrs = new rknn_tensor_attr[io_num.n_input];
-    memset(input_attrs, 0, sizeof(input_attrs));
+    memset(input_attrs, 0, sizeof(rknn_tensor_attr) * io_num.n_input);
     for (int i = 0; i < io_num.n_input; i++)
     {
         input_attrs[i].index = i;
@@ -114,7 +124,7 @@ rknn_lite::rknn_lite(const char *model_name, int n, int class_num, int id)
 
     // 设置输出数组
     output_attrs = new rknn_tensor_attr[io_num.n_output];
-    memset(output_attrs, 0, sizeof(output_attrs));
+    memset(output_attrs, 0, sizeof(rknn_tensor_attr) * io_num.n_output);
     for (int i = 0; i < io_num.n_output; i++)
     {
         output_attrs[i].index = i;
@@ -174,9 +184,6 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
     // 获取npu的推演输出结果
     ret = rknn_outputs_get(rkModel, io_num.n_output, outputs, NULL);
 
-    const float nms_threshold = NMS_THRESH;
-    const float box_conf_threshold = BOX_THRESH;
-
     float scale_w = (float)width / img_width;
     float scale_h = (float)height / img_height;
 
@@ -189,25 +196,7 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
     }
 
     post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
-                 box_conf_threshold, nms_threshold, scale_w, scale_h, out_zps, out_scales, &detect_result_group, class_num);
-
-    // Draw Objects
-    char text[256];
-    // std::cout << detect_result_group.count << " objects detected.\n";
-    for (int i = 0; i < detect_result_group.count; i++)
-    {
-        detect_result_t *det_result = &(detect_result_group.results[i]);
-        sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        if (id == 0)
-            rectangle(ori_img, cv::Point(x1, y1), cv::Point(det_result->box.right, det_result->box.bottom), cv::Scalar(0, 255, 0, 0), 3);
-        else
-        {
-            rectangle(ori_img, cv::Point(x1, y1), cv::Point(det_result->box.right, det_result->box.bottom), cv::Scalar(0, 0, 255, 0), 3);
-        }
-        //putText(ori_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255));
-    }
+                 box_conf_threshold_, nms_threshold_, scale_w, scale_h, out_zps, out_scales, &detect_result_group, class_num);
 
     ret = rknn_outputs_release(rkModel, io_num.n_output, outputs);
 

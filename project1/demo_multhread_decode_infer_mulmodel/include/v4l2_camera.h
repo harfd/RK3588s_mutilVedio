@@ -25,7 +25,8 @@ public:
     V4L2Camera(const V4L2Camera &) = delete;
     V4L2Camera &operator=(const V4L2Camera &) = delete;
 
-    int open(const std::string &device_path);
+    int open(const std::string &device_path, int requested_width = 0,
+             int requested_height = 0, int requested_fps = 0);
     bool captureFrame(Mbuffer &output, const std::atomic<bool> &stop_flag);
     void close();
 
@@ -41,8 +42,8 @@ private:
         size_t size = 0;
     };
 
-    static constexpr int kRequestedWidth = 4224;
-    static constexpr int kRequestedHeight = 3136;
+    static constexpr int kDefaultRequestedWidth = 4224;
+    static constexpr int kDefaultRequestedHeight = 3136;
     static constexpr int kOutputWidth = 1280;
     static constexpr int kOutputHeight = 960;
     static constexpr uint32_t kCaptureBufferCount = 4;
@@ -64,6 +65,9 @@ private:
     int source_height_ = 0;
     int source_stride_ = 0;
     size_t source_size_ = 0;
+    int requested_width_ = kDefaultRequestedWidth;
+    int requested_height_ = kDefaultRequestedHeight;
+    int requested_fps_ = 0;
 
     std::vector<DmaBuffer> capture_buffers_;
     DmaBuffer scaled_nv12_;

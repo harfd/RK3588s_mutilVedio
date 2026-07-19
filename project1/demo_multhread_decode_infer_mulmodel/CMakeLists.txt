@@ -93,6 +93,7 @@ include_directories(
 
 # ================= demo 源码 =================
 set(DEMO_LIB_SOURCES
+    ${PROJECT_ROOT}/lib/app_config.cpp
     ${PROJECT_ROOT}/lib/detection_fusion_manager.cpp
     ${PROJECT_ROOT}/lib/mpp_decoder.cpp
     ${PROJECT_ROOT}/lib/mpp_encoder.cpp
@@ -106,6 +107,12 @@ set(DEMO_LIB_SOURCES
 add_executable(myDemo
     main.cpp
     ${DEMO_LIB_SOURCES}
+)
+
+# myDemo intentionally loads only this file. Keeping the absolute source path
+# makes the config location independent from the process working directory.
+target_compile_definitions(myDemo PRIVATE
+    APP_CONFIG_FILE="${PROJECT_ROOT}/config_user.ini"
 )
 
 # ================= 链接（全部用绝对路径） =================

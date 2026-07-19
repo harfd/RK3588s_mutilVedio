@@ -30,6 +30,7 @@ extern "C"
 #include <string>
 using std::queue;
 using std::vector;
+#include "app_config.h"
 #include "m_buffer.hpp"
 
 
@@ -57,12 +58,16 @@ public:
     int current_pkt_id = 0;
     // 当前对象的唯一标识号
     int stream_loader_id;
-    // 流地址
-    std::string stream_url;
+    // 输入源配置
+    StreamSourceConfig source_;
+    StreamSourceConfig source_;
+    std::string stream_url_;
     int width = 0;
     int height = 0;
     int status = 0;
     bool isnotAnnexB = false;
+    bool decoder_initialized_ = false;
+    int decoder_type_ = 0;
     MppDecoderFrameCallback callback;
 
     // 管理图像数据
@@ -78,7 +83,7 @@ public:
 
     void close();
     bool read_frame();
-    StreamLoader(const std::string &url, int id);
+    StreamLoader(const StreamSourceConfig& source, int id);
     ~StreamLoader();
     int open();
     void operator()();
@@ -88,19 +93,7 @@ public:
 class StreamLoaderManager
 {
 public:
-    // -----------------------------------------------
-    // 本地测试用例
-    // char *url105 = "rtsp://admin:jhx12345@192.168.1.105:554/Streaming/Channels/101";
-    // char *url104 = "rtsp://admin:jhx12345@192.168.1.104:554/Streaming/Channels/101";
-    // vector<char *> urls = {url105, url104, url105, url104, url105, url104};
-    std::string url1 = "../../1.mp4";
-    std::string url2 = "../../2.mp4";
-    std::string url3 = "../../3.mp4";
-    std::string url4 = "../../4.mp4";
-    std::string camera5 = "/dev/v4l/by-path/platform-rkisp1-vir0-video-index0";
-    vector<std::string> urls = {url1, url2, url3, url4, camera5, url3};
-    int num_stream = 4;
-    // -----------------------------------------------
+    int num_stream = 0;
     // 禁止拷贝构造和赋值操作
     StreamLoaderManager(const StreamLoaderManager &) = delete;
     StreamLoaderManager &operator=(const StreamLoaderManager &) = delete;
@@ -112,14 +105,16 @@ public:
         return instance;
     }
 
+    void configure(const vector<StreamSourceConfig>& sources);
     // 加载流
-    void load_stream(int id);
+    bool load_stream(int id);
     // 停止流
     // 该函数没有使用
     void unload_stream(int id);
 
     vector<StreamLoader *> stream_loaders;
     vector<std::thread> threads;
+    vector<StreamSourceConfig> sources_;
 
 private:
     // 私有构造函数，防止从外部创建对象

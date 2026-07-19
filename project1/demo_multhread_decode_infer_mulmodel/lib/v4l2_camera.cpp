@@ -44,10 +44,18 @@ V4L2Camera::~V4L2Camera()
     close();
 }
 
-int V4L2Camera::open(const std::string &device_path)
+int V4L2Camera::open(const std::string &device_path, int requested_width,
+                     int requested_height, int requested_fps)
 {
     close();
     device_path_ = device_path;
+    requested_width_ = requested_width > 0
+                           ? requested_width
+                           : kDefaultRequestedWidth;
+    requested_height_ = requested_height > 0
+                            ? requested_height
+                            : kDefaultRequestedHeight;
+    requested_fps_ = requested_fps;
 
     camera_fd_ = ::open(device_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (camera_fd_ < 0)
@@ -139,15 +147,15 @@ int V4L2Camera::configureDevice()
 
     if (is_multiplanar_)
     {
-        format.fmt.pix_mp.width = kRequestedWidth;
-        format.fmt.pix_mp.height = kRequestedHeight;
+        format.fmt.pix_mp.width = requested_width_;
+        format.fmt.pix_mp.height = requested_height_;
         format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
         format.fmt.pix_mp.field = V4L2_FIELD_ANY;
     }
     else
     {
-        format.fmt.pix.width = kRequestedWidth;
-        format.fmt.pix.height = kRequestedHeight;
+        format.fmt.pix.width = requested_width_;
+        format.fmt.pix.height = requested_height_;
         format.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
         format.fmt.pix.field = V4L2_FIELD_ANY;
     }
@@ -156,6 +164,20 @@ int V4L2Camera::configureDevice()
     {
         logErrno("VIDIOC_S_FMT(NV12)", device_path_);
         return -errno;
+    }
+
+    if (requested_fps_ > 0)
+    {
+        struct v4l2_streamparm stream_params = {};
+        stream_params.type = buffer_type_;
+        stream_params.parm.capture.timeperframe.numerator = 1;
+        stream_params.parm.capture.timeperframe.denominator = requested_fps_;
+        if (xioctl(camera_fd_, VIDIOC_S_PARM, &stream_params) < 0)
+        {
+            std::cerr << "VIDIOC_S_PARM(" << requested_fps_
+                      << " fps) is not supported by " << device_path_
+                      << "; continuing with the driver frame rate" << std::endl;
+        }
     }
 
     uint32_t pixel_format;

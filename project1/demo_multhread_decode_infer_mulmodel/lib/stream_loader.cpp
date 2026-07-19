@@ -9,18 +9,8 @@
 #include "stream_loader.h"
 #include "im2d.h"
 #include <chrono>
-#include <stdexcept>
 #include <string>
 #include <thread>
-
-namespace
-{
-bool isV4L2DevicePath(const std::string &path)
-{
-    return path.rfind("/dev/v4l/", 0) == 0 ||
-           path.rfind("/dev/video", 0) == 0;
-}
-} // namespace
 
 // 判断是否为 Annex B 格式
 // 该函数并没有使用
@@ -105,6 +95,12 @@ void StreamLoader::close()
     }
 
     decoder.Reset();
+    if (bsf_ctx)
+    {
+        av_bsf_free(&bsf_ctx);
+    }
+    bsf = nullptr;
+    isnotAnnexB = false;
     if (temp_pkt)
     {
         av_packet_free(&temp_pkt); // 释放 temp_pkt 并将指针置为 nullptr
@@ -120,11 +116,10 @@ void StreamLoader::close()
     {
         avcodec_parameters_free(&codecPar); // 释放 codecPar 结构
     }
-
-    if (bsf_ctx)
-        av_bsf_free(&bsf_ctx);
-    av_dict_free(&options);
-    isnotAnnexB = false;
+    if (options)
+    {
+        av_dict_free(&options);
+    }
 }
 
 bool StreamLoader::read_frame()
@@ -204,14 +199,22 @@ bool StreamLoader::read_frame()
     }
 }
 
-StreamLoader::StreamLoader(const std::string &url, int id)
+StreamLoader::StreamLoader(const StreamSourceConfig& source, int id)
+    : source_(source)
 {
     stream_loader_id = id;
     std::cout << "StreamLoader: " << std::to_string(id) << std::endl;
     callback = mpp_decoder_frame_callback;
-    // mat_ptr = new cv::Mat();
-
-    stream_url = url;
+    if (source_.type == InputSourceType::Camera)
+    {
+        stream_url_ = source_.device_path.empty()
+                          ? "/dev/video" + std::to_string(source_.device_index)
+                          : source_.device_path;
+    }
+    else
+    {
+        stream_url_ = source_.url;
+    }
     status = 0;
     stopFlag = false;
 }
@@ -225,14 +228,15 @@ StreamLoader::~StreamLoader()
 
 int StreamLoader::open()
 {
-    is_v4l2_camera_ = isV4L2DevicePath(stream_url);
+    is_v4l2_camera_ = source_.type == InputSourceType::Camera;
     if (is_v4l2_camera_)
     {
         buffer.throttle = false;
         buffer.frame_interval_ms = 0;
         is_local_file_ = false;
 
-        const int ret = camera_.open(stream_url);
+        const int ret = camera_.open(stream_url_, source_.width,
+                                     source_.height, source_.fps);
         status = ret;
         if (ret == 0)
         {
@@ -242,31 +246,43 @@ int StreamLoader::open()
         return ret;
     }
 
+    close();
     temp_pkt = av_packet_alloc();
     // av_init_packet is deprecated in FFmpeg 7.x, av_packet_alloc() already initializes the packet
     codecPar = avcodec_parameters_alloc();
     // pFrame = av_frame_alloc();
     // temp_frame = av_frame_alloc();
-    av_dict_set(&options, "rtbufsize", "8192000", 0);
-    av_dict_set(&options, "start_time_realtime", 0, 0);
-    av_dict_set(&options, "rtsp_transport", "tcp", 0);
-    av_dict_set(&options, "stimeout", "2000000", 0);
-    av_dict_set(&options, "max_delay", "500000", 0);
-
-    // 打开RTSP流
-    if (avformat_open_input(&fmtCtx, stream_url.c_str(), NULL, &options) != 0)
+    if (!temp_pkt || !codecPar)
     {
-        std::cout << "open rtsp stream failed" << std::endl;
+        std::cerr << "allocate FFmpeg input structures failed" << std::endl;
+        close();
+        return -1;
+    }
+
+    if (source_.type == InputSourceType::Rtsp)
+    {
+        av_dict_set(&options, "rtbufsize", "8192000", 0);
+        av_dict_set(&options, "rtsp_transport", "tcp", 0);
+        av_dict_set(&options, "stimeout", "2000000", 0);
+        av_dict_set(&options, "max_delay", "500000", 0);
+    }
+
+    if (avformat_open_input(&fmtCtx, stream_url_.c_str(), NULL, &options) != 0)
+    {
+        std::cout << "open " << input_source_type_name(source_.type)
+                  << " source failed: " << stream_url_ << std::endl;
+        close();
         return -1;
     }
     // 查找RTSP流信息
     if (avformat_find_stream_info(fmtCtx, NULL) < 0)
     {
+        close();
         return -1;
     }
 
     // 打印视频相关信息
-    av_dump_format(fmtCtx, 0, stream_url.c_str(), 0);
+    av_dump_format(fmtCtx, 0, stream_url_.c_str(), 0);
     // 获取视频的信息
     videoStreamIndex = -1;
     for (unsigned int i = 0; i < fmtCtx->nb_streams; i++)
@@ -282,25 +298,59 @@ int StreamLoader::open()
     std::cout << "videoindex: " << videoStreamIndex << std::endl;
     if (videoStreamIndex < 0)
     {
+        close();
         return -2;
     }
 
-    AVCodecID rtsp_format = fmtCtx->streams[videoStreamIndex]->codecpar->codec_id;
-    if (status == 0)
+    AVCodecID input_format = fmtCtx->streams[videoStreamIndex]->codecpar->codec_id;
+    int required_decoder_type = 0;
+    const char* bitstream_filter = nullptr;
+    if (input_format == AV_CODEC_ID_H264)
     {
-        int ret = 0;
-        void *src_buffer = &(this->buffer);
-        switch (rtsp_format)
+        required_decoder_type = 264;
+        bitstream_filter = "h264_mp4toannexb";
+    }
+    else if (input_format == AV_CODEC_ID_HEVC)
+    {
+        required_decoder_type = 265;
+        bitstream_filter = "hevc_mp4toannexb";
+    }
+    else
+    {
+        std::cerr << "MPP input only supports H.264/H.265, codec id="
+                  << input_format << std::endl;
+        close();
+        return -3;
+    }
+
+    if (!decoder_initialized_)
+    {
+        const int ret = decoder.Init(required_decoder_type, source_.fps,
+                                     &(this->buffer), stream_loader_id);
+        if (ret <= 0)
         {
-        case AV_CODEC_ID_H264:
-            ret = decoder.Init(264, 25, src_buffer, stream_loader_id);
-            // ----------------------------------------------------------
-            // 查找H.264比特流过滤器
-            bsf = av_bsf_get_by_name("h264_mp4toannexb");
+            std::cerr << "initialize MPP decoder failed" << std::endl;
+            close();
+            return -3;
+        }
+        decoder_initialized_ = true;
+        decoder_type_ = required_decoder_type;
+    }
+    else if (decoder_type_ != required_decoder_type)
+    {
+        std::cerr << "codec changed after reconnect; restart is required"
+                  << std::endl;
+        close();
+        return -3;
+    }
+
+    if (source_.type == InputSourceType::Mp4)
+    {
+            bsf = av_bsf_get_by_name(bitstream_filter);
             if (!bsf)
             {
-                fprintf(stderr, "Could not find h264_mp4toannexb filter\n");
-                avformat_close_input(&fmtCtx);
+                fprintf(stderr, "Could not find MP4 Annex-B filter\n");
+                close();
                 return -3;
             }
 
@@ -308,29 +358,22 @@ int StreamLoader::open()
             if (av_bsf_alloc(bsf, &bsf_ctx) < 0)
             {
                 fprintf(stderr, "Could not allocate bsf context\n");
-                avformat_close_input(&fmtCtx);
+                close();
                 return -3;
             }
             // 设置过滤器参数
-            avcodec_parameters_copy(bsf_ctx->par_in, fmtCtx->streams[0]->codecpar);
-            bsf_ctx->time_base_in = fmtCtx->streams[0]->time_base;
+            avcodec_parameters_copy(
+                bsf_ctx->par_in,
+                fmtCtx->streams[videoStreamIndex]->codecpar);
+            bsf_ctx->time_base_in = fmtCtx->streams[videoStreamIndex]->time_base;
 
             if (av_bsf_init(bsf_ctx) < 0)
             {
                 fprintf(stderr, "Could not initialize bsf context\n");
-                av_bsf_free(&bsf_ctx);
-                avformat_close_input(&fmtCtx);
+                close();
                 return -3;
             }
             isnotAnnexB = true;
-            // ----------------------------------------------------------
-            std::cout << "H264 " << ret << std::endl;
-            break;
-        case AV_CODEC_ID_HEVC:
-            ret = decoder.Init(265, 25, src_buffer, stream_loader_id);
-            std::cout << "HEVC " << ret << std::endl;
-            break;
-        }
     }
 
     decoder.SetCallback(this->callback);
@@ -343,84 +386,74 @@ int StreamLoader::open()
     if (fps <= 0) fps = 25.0;
     source_fps_ = fps;
 
-    is_local_file_ = stream_url.rfind("rtsp://", 0) != 0 &&
-                     stream_url.rfind("rtmp://", 0) != 0;
+    is_local_file_ = source_.type == InputSourceType::Mp4;
 
     if (is_local_file_ && source_fps_ > 0) {
         buffer.throttle = true;
-        buffer.frame_interval_ms = (int)(1000.0 / source_fps_ * 1.2);
+        buffer.frame_interval_ms = (int)(1000.0 / source_fps_);
+    } else {
+        buffer.throttle = false;
+        buffer.frame_interval_ms = 0;
     }
 
     status = 0;
     return 0;
 }
 
-
 void StreamLoader::operator()()
 {
-    while (stopFlag == false)
+    while (!stopFlag)
     {
-        try
+        if (open() != 0)
         {
-            if (status == 0 && !read_frame() && status == 0)
-                status = -1;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(source_.reconnect_interval_ms));
+            continue;
         }
-        catch (std::exception &e)
+
+        while (!stopFlag && read_frame())
         {
-            std::cout << "exception ............" << std::endl;
-            std::cout << e.what() << std::endl;
-            status = -1;
         }
-        if (status && !stopFlag)
+        close();
+        if (stopFlag || (source_.type == InputSourceType::Mp4 && !source_.loop))
         {
-            std::cout << "Stream " << stream_loader_id
-                      << " read failed, reopening..." << std::endl;
-
-            // 先关闭当前流，清理解码器和 AVFormatContext
-            close();
-
-            // 网络流、相机和本地文件采用不同的重试间隔。
-            const bool is_network_stream =
-                stream_url.rfind("rtsp://", 0) == 0 ||
-                stream_url.rfind("rtmp://", 0) == 0;
-            const bool is_camera = isV4L2DevicePath(stream_url);
-            const int retry_ms = is_network_stream ? 10000 : (is_camera ? 1000 : 100);
-
-            while (!stopFlag && open() != 0)
-            {
-                std::cout << "Reopen failed, retry after " << retry_ms
-                          << " ms, id = " << stream_loader_id << std::endl;
-                std::this_thread::sleep_for(std::chrono::milliseconds(retry_ms));
-            }
-
-            if (stopFlag)
-                break;
-
-            std::cout << "Stream reopened, id = " << stream_loader_id << std::endl;
-
-            // 重置状态，继续正常读取帧
-            status = 0;
+            break;
         }
+        std::cout << "reopening " << input_source_type_name(source_.type)
+                  << " source, stream=" << stream_loader_id << std::endl;
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(source_.reconnect_interval_ms));
     }
+    stopFlag = true;
 }
 
 // ==================================================================================================
 
-void StreamLoaderManager::load_stream(int id)
+void StreamLoaderManager::configure(const vector<StreamSourceConfig>& sources)
 {
-    if (id < 0 || static_cast<size_t>(id) >= urls.size())
-        throw std::out_of_range("stream id exceeds configured source count");
+    sources_ = sources;
+    num_stream = static_cast<int>(sources_.size());
+}
 
+bool StreamLoaderManager::load_stream(int id)
+{
+    if (id < 0 || id >= static_cast<int>(sources_.size()))
+    {
+        std::cerr << "invalid stream id: " << id << std::endl;
+        return false;
+    }
     std::cout << "Loading stream id: " << id << std::endl;
-    StreamLoader *loader = new StreamLoader(urls[id], id);
-    loader->status = loader->open();
+    StreamLoader *loader = new StreamLoader(sources_[id], id);
     stream_loaders.push_back(loader);
     threads.emplace_back(std::thread(std::ref(*loader)));
+    return true;
 }
 
 // 卸载流
 void StreamLoaderManager::unload_stream(int id)
 {
+    if (id < 0 || id >= static_cast<int>(stream_loaders.size()))
+        return;
     std::cout << "Unloading stream id: " << id << std::endl;
     stream_loaders[id]->stopFlag = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
