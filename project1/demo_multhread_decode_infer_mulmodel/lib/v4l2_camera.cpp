@@ -45,7 +45,8 @@ V4L2Camera::~V4L2Camera()
 }
 
 int V4L2Camera::open(const std::string &device_path, int requested_width,
-                     int requested_height, int requested_fps)
+                     int requested_height, int requested_fps,
+                     bool use_nv21)
 {
     close();
     device_path_ = device_path;
@@ -56,6 +57,7 @@ int V4L2Camera::open(const std::string &device_path, int requested_width,
                             ? requested_height
                             : kDefaultRequestedHeight;
     requested_fps_ = requested_fps;
+    use_nv21_ = use_nv21;
 
     camera_fd_ = ::open(device_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (camera_fd_ < 0)
@@ -103,6 +105,8 @@ int V4L2Camera::open(const std::string &device_path, int requested_width,
               << ", stride=" << source_stride_
               << ", size=" << source_size_
               << ", output=" << kOutputWidth << "x" << kOutputHeight
+              << ", chroma=" << (use_nv21_ ? "VU(NV21)" : "UV(NV12)")
+              << ", range=" << (full_range_ ? "full" : "limited")
               << std::endl;
     return 0;
 }
@@ -181,9 +185,11 @@ int V4L2Camera::configureDevice()
     }
 
     uint32_t pixel_format;
+    uint32_t quantization;
     if (is_multiplanar_)
     {
         pixel_format = format.fmt.pix_mp.pixelformat;
+        quantization = format.fmt.pix_mp.quantization;
         plane_count_ = format.fmt.pix_mp.num_planes;
         source_width_ = static_cast<int>(format.fmt.pix_mp.width);
         source_height_ = static_cast<int>(format.fmt.pix_mp.height);
@@ -202,6 +208,7 @@ int V4L2Camera::configureDevice()
     else
     {
         pixel_format = format.fmt.pix.pixelformat;
+        quantization = format.fmt.pix.quantization;
         plane_count_ = 1;
         source_width_ = static_cast<int>(format.fmt.pix.width);
         source_height_ = static_cast<int>(format.fmt.pix.height);
@@ -214,6 +221,8 @@ int V4L2Camera::configureDevice()
         std::cerr << device_path_ << " did not accept NV12 format" << std::endl;
         return -ENOTSUP;
     }
+
+    full_range_ = quantization == V4L2_QUANTIZATION_FULL_RANGE;
 
     if (source_stride_ <= 0)
         source_stride_ = source_width_;
@@ -392,21 +401,25 @@ bool V4L2Camera::captureFrame(Mbuffer &output, const std::atomic<bool> &stop_fla
 
 bool V4L2Camera::processBuffer(uint32_t index, Mbuffer &output)
 {
+    const int yuv_format = use_nv21_
+                               ? RK_FORMAT_YCrCb_420_SP
+                               : RK_FORMAT_YCbCr_420_SP;
     rga_buffer_t source = wrapbuffer_fd_t(
         capture_buffers_[index].fd,
         source_width_, source_height_,
         source_stride_, source_height_,
-        RK_FORMAT_YCbCr_420_SP);
+        yuv_format);
     rga_buffer_t scaled = wrapbuffer_fd_t(
         scaled_nv12_.fd,
         kOutputWidth, kOutputHeight,
         kOutputWidth, kOutputHeight,
-        RK_FORMAT_YCbCr_420_SP);
+        yuv_format);
 
     IM_STATUS status = imresize(source, scaled);
     if (status != IM_STATUS_SUCCESS)
     {
-        std::cerr << "RGA NV12 resize failed: " << imStrError(status) << std::endl;
+        std::cerr << "RGA camera YUV resize failed: "
+                  << imStrError(status) << std::endl;
         return false;
     }
 
@@ -424,11 +437,13 @@ bool V4L2Camera::processBuffer(uint32_t index, Mbuffer &output)
         kOutputWidth, kOutputHeight,
         RK_FORMAT_BGR_888);
     status = imcvtcolor(scaled, bgr,
-                        RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888,
-                        IM_COLOR_SPACE_DEFAULT);
+                        yuv_format, RK_FORMAT_BGR_888,
+                        full_range_ ? IM_YUV_TO_RGB_BT601_FULL
+                                    : IM_YUV_TO_RGB_BT601_LIMIT);
     if (status != IM_STATUS_SUCCESS)
     {
-        std::cerr << "RGA NV12 to BGR failed: " << imStrError(status) << std::endl;
+        std::cerr << "RGA camera YUV to BGR failed: "
+                  << imStrError(status) << std::endl;
         return false;
     }
 

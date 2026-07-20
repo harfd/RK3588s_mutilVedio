@@ -26,7 +26,8 @@ public:
     V4L2Camera &operator=(const V4L2Camera &) = delete;
 
     int open(const std::string &device_path, int requested_width = 0,
-             int requested_height = 0, int requested_fps = 0);
+             int requested_height = 0, int requested_fps = 0,
+             bool use_nv21 = false);
     bool captureFrame(Mbuffer &output, const std::atomic<bool> &stop_flag);
     void close();
 
@@ -68,6 +69,8 @@ private:
     int requested_width_ = kDefaultRequestedWidth;
     int requested_height_ = kDefaultRequestedHeight;
     int requested_fps_ = 0;
+    bool use_nv21_ = false;
+    bool full_range_ = false;
 
     std::vector<DmaBuffer> capture_buffers_;
     DmaBuffer scaled_nv12_;

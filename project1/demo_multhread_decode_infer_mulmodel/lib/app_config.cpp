@@ -309,6 +309,8 @@ bool AppConfigLoader::load(const std::string& file_path, AppConfig& config,
         }
         source.url = get_string(data, section, "url");
         source.device_path = get_string(data, section, "device_path");
+        source.chroma_order = lower(
+            get_string(data, section, "chroma_order", "uv"));
         if (source.type == InputSourceType::Mp4) {
             source.url = resolve_path(base, source.url);
         }
@@ -320,6 +322,11 @@ bool AppConfigLoader::load(const std::string& file_path, AppConfig& config,
         if (source.fps < 1 || source.reconnect_interval_ms < 0 ||
             source.width < 0 || source.height < 0) {
             error = "invalid capture settings in [" + section + "]";
+            return false;
+        }
+        if (source.type == InputSourceType::Camera &&
+            source.chroma_order != "uv" && source.chroma_order != "vu") {
+            error = "[" + section + "] chroma_order must be uv or vu";
             return false;
         }
         if (source.enabled) {

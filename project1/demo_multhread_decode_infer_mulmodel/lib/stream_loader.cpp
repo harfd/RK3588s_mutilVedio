@@ -236,7 +236,8 @@ int StreamLoader::open()
         is_local_file_ = false;
 
         const int ret = camera_.open(stream_url_, source_.width,
-                                     source_.height, source_.fps);
+                                     source_.height, source_.fps,
+                                     source_.chroma_order == "vu");
         status = ret;
         if (ret == 0)
         {
