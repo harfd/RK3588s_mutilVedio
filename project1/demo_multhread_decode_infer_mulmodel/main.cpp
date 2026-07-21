@@ -20,9 +20,9 @@
 
 #include "app_config.h"
 #include "detection_fusion_manager.h"
+#include "dma_image.hpp"
 #include "realtime_logger.h"
 #include "im2d.h"
-#include "include/dma_alloc.hpp"
 #include "rknnPool.hpp"
 #include "stream_loader.h"
 #include "streaming_manager.h"
@@ -34,7 +34,7 @@
 StreamLoaderManager& manager = StreamLoaderManager::getInstance();
 std::vector<std::unique_ptr<rknn_lite>> rk_pool;
 std::vector<std::thread> rk_threads;
-std::vector<cv::Mat> images(6);
+std::vector<std::shared_ptr<DmaImageBuffer>> images(6);
 std::vector<std::mutex> mutexes(6);
 StreamingManager streaming_manager;
 DetectionFusionManager fusion_manager;
@@ -98,28 +98,38 @@ int findCameraStreamIndex(const std::vector<StreamSourceConfig>& sources)
     return -1;
 }
 
-cv::Mat centerCropToAspect(const cv::Mat &image, int target_width, int target_height)
+im_rect centerCropToAspect(const DmaImageBuffer &image,
+                           int target_width, int target_height)
 {
-    if (image.empty() || target_width <= 0 || target_height <= 0)
-        return image;
+    im_rect crop = {0, 0, image.width(), image.height()};
+    if (target_width <= 0 || target_height <= 0)
+        return crop;
 
-    const int64_t source_aspect = static_cast<int64_t>(image.cols) * target_height;
-    const int64_t target_aspect = static_cast<int64_t>(image.rows) * target_width;
+    const int64_t source_aspect =
+        static_cast<int64_t>(image.width()) * target_height;
+    const int64_t target_aspect =
+        static_cast<int64_t>(image.height()) * target_width;
     if (source_aspect == target_aspect)
-        return image;
+        return crop;
 
-    int crop_width = image.cols;
-    int crop_height = image.rows;
+    int crop_width = image.width();
+    int crop_height = image.height();
     if (source_aspect > target_aspect)
-        crop_width = static_cast<int>(static_cast<int64_t>(image.rows) * target_width / target_height);
+        crop_width = static_cast<int>(
+            static_cast<int64_t>(image.height()) * target_width /
+            target_height);
     else
-        crop_height = static_cast<int>(static_cast<int64_t>(image.cols) * target_height / target_width);
+        crop_height = static_cast<int>(
+            static_cast<int64_t>(image.width()) * target_height /
+            target_width);
 
     crop_width = std::max(2, crop_width & ~1);
     crop_height = std::max(2, crop_height & ~1);
-    const int x = (image.cols - crop_width) / 2;
-    const int y = (image.rows - crop_height) / 2;
-    return image(cv::Rect(x, y, crop_width, crop_height));
+    crop.x = (image.width() - crop_width) / 2;
+    crop.y = (image.height() - crop_height) / 2;
+    crop.width = crop_width;
+    crop.height = crop_height;
+    return crop;
 }
 
 void sharpenCameraTile(cv::Mat &image)
@@ -136,114 +146,125 @@ void sharpenCameraTile(cv::Mat &image)
 void combineImage(StreamLoaderManager& stream_manager, int target_fps,
                   bool streaming_enabled, int camera_stream_index)
 {
-    cv::Mat combined_image(kCompositeHeight, kCompositeWidth,
-                           CV_8UC3, cv::Scalar(0, 0, 0));
-    cv::Mat last_combined_image;
-    bool has_last_frame = false;
-    const int frame_interval_ms = 1000 / target_fps;
-    struct DmaTileBuffer {
-        int fd = -1;
-        void *va = nullptr;
-        int width = 0;
-        int height = 0;
-        cv::Mat view;
-    };
-    std::vector<DmaTileBuffer> tile_buffers(stream_manager.num_stream);
-    for (int i = 0; i < stream_manager.num_stream; ++i) {
-        const StreamLayout layout = getStreamLayout(i, camera_stream_index);
-        tile_buffers[i].width = layout.width;
-        tile_buffers[i].height = layout.height;
-        const size_t tile_size = static_cast<size_t>(layout.width) * layout.height * 3;
-        if (dma_buf_alloc(DMA_HEAP_PATH, tile_size, &tile_buffers[i].fd, &tile_buffers[i].va) == 0) {
-            tile_buffers[i].view = cv::Mat(layout.height, layout.width,
-                                           CV_8UC3, tile_buffers[i].va);
-        }
+    DmaImagePool composite_pool;
+    const size_t composite_size =
+        static_cast<size_t>(kCompositeWidth) * kCompositeHeight * 3;
+    if (!composite_pool.configure(
+            4, kCompositeWidth, kCompositeHeight,
+            kCompositeWidth, kCompositeHeight,
+            RK_FORMAT_BGR_888, composite_size))
+    {
+        std::cerr << "Failed to allocate composite DMA-BUF pool" << std::endl;
+        return;
     }
 
+    std::vector<std::shared_ptr<DmaImageBuffer>> latest_frames(
+        stream_manager.num_stream);
+    const int frame_interval_ms = 1000 / std::max(target_fps, 1);
+
     auto last_frame_time = std::chrono::steady_clock::now();
-    while (true) {
+    while (true)
+    {
         auto current_time = std::chrono::steady_clock::now();
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 current_time - last_frame_time)
                 .count();
-        if (elapsed < frame_interval_ms) {
+        if (elapsed < frame_interval_ms)
+        {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(frame_interval_ms - elapsed));
             current_time = std::chrono::steady_clock::now();
         }
         last_frame_time = current_time;
 
-        bool has_new_frame = false;
-        for (int i = 0; i < stream_manager.num_stream; ++i) {
-            cv::Mat local_image;
+        auto combined_frame = composite_pool.acquire();
+        if (!combined_frame)
+        {
+            static uint64_t dropped_frames = 0;
+            ++dropped_frames;
+            if (dropped_frames == 1 || dropped_frames % 100 == 0)
+                std::cerr << "Composite DMA pool is busy; dropped "
+                          << dropped_frames << " frame(s)" << std::endl;
+            continue;
+        }
+
+        rga_buffer_t combined_buffer = wrapbuffer_handle_t(
+            combined_frame->rgaHandle(),
+            kCompositeWidth, kCompositeHeight,
+            combined_frame->widthStride(), combined_frame->heightStride(),
+            RK_FORMAT_BGR_888);
+        const im_rect full_rect = {
+            0, 0, kCompositeWidth, kCompositeHeight};
+        if (imfill(combined_buffer, full_rect, 0) != IM_STATUS_SUCCESS)
+        {
+            std::cerr << "RGA failed to clear composite frame" << std::endl;
+            continue;
+        }
+
+        bool has_frame = false;
+        for (int i = 0; i < stream_manager.num_stream; ++i)
+        {
             {
                 std::lock_guard<std::mutex> lock(mutexes[i]);
-                if (images[i].empty()) {
-                    continue;
-                }
-                local_image = std::move(images[i]);
-                images[i] = cv::Mat();
+                if (images[i])
+                    latest_frames[i] = std::move(images[i]);
             }
+            const auto &source_frame = latest_frames[i];
+            if (!source_frame || !source_frame->syncForDevice())
+                continue;
 
             const StreamLayout layout = getStreamLayout(i, camera_stream_index);
-            cv::Mat resize_source = local_image;
-            if (i == camera_stream_index)
-                resize_source = centerCropToAspect(local_image, layout.width, layout.height);
+            if (layout.width <= 0 || layout.height <= 0)
+                continue;
 
-            cv::Mat resized_image;
-            int src_w = resize_source.cols, src_h = resize_source.rows;
-            bool tile_cpu_access_active = false;
-
-            if (tile_buffers[i].va == nullptr) {
-                cv::resize(resize_source, resized_image,
-                           cv::Size(layout.width, layout.height),
-                           0.0, 0.0, cv::INTER_AREA);
-            } else {
-                const int src_stride_pixels = static_cast<int>(resize_source.step / resize_source.elemSize());
-                rga_buffer_t src_buf = wrapbuffer_virtualaddr_t(
-                    resize_source.data, src_w, src_h,
-                    src_stride_pixels, src_h, RK_FORMAT_BGR_888);
-                rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
-                    tile_buffers[i].va, layout.width, layout.height,
-                    RK_FORMAT_BGR_888);
-                IM_STATUS status = imresize(src_buf, dst_buf);
-                if (status == IM_STATUS_SUCCESS &&
-                    dma_sync_device_to_cpu(tile_buffers[i].fd) == 0) {
-                    resized_image = tile_buffers[i].view;
-                    tile_cpu_access_active = true;
-                } else {
-                    cv::resize(resize_source, resized_image,
-                               cv::Size(layout.width, layout.height),
-                               0.0, 0.0, cv::INTER_AREA);
-                }
+            rga_buffer_t source_buffer = wrapbuffer_handle_t(
+                source_frame->rgaHandle(),
+                source_frame->width(), source_frame->height(),
+                source_frame->widthStride(), source_frame->heightStride(),
+                RK_FORMAT_BGR_888);
+            const im_rect source_rect = centerCropToAspect(
+                *source_frame, layout.width, layout.height);
+            const im_rect destination_rect = {
+                layout.x, layout.y, layout.width, layout.height};
+            const rga_buffer_t empty_buffer = {};
+            const im_rect empty_rect = {};
+            const IM_STATUS status = improcess(
+                source_buffer, combined_buffer, empty_buffer,
+                source_rect, destination_rect, empty_rect, IM_SYNC);
+            if (status != IM_STATUS_SUCCESS)
+            {
+                std::cerr << "RGA composite failed for stream " << i
+                          << ": " << imStrError_t(status) << std::endl;
+                continue;
             }
-
-            if (i == camera_stream_index)
-                sharpenCameraTile(resized_image);
-
-            resized_image.copyTo(combined_image(cv::Rect(
-                layout.x, layout.y, layout.width, layout.height)));
-            if (tile_cpu_access_active)
-                dma_sync_cpu_to_device(tile_buffers[i].fd);
-            has_new_frame = true;
+            has_frame = true;
         }
 
-        cv::Mat frame_to_send;
-        if (has_new_frame) {
-            last_combined_image = combined_image.clone();
-            frame_to_send = last_combined_image;
-            has_last_frame = true;
-        } else if (has_last_frame) {
-            frame_to_send = last_combined_image;
-        } else {
-            frame_to_send = combined_image.clone();
+        if (!has_frame)
+            continue;
+
+        if (camera_stream_index >= 0)
+        {
+            if (!combined_frame->syncForCpu())
+                continue;
+            const StreamLayout camera_layout = getStreamLayout(
+                camera_stream_index, camera_stream_index);
+            cv::Mat camera_tile = combined_frame->bgrView()(
+                cv::Rect(camera_layout.x, camera_layout.y,
+                         camera_layout.width, camera_layout.height));
+            sharpenCameraTile(camera_tile);
         }
-        if (streaming_enabled) {
+
+        // 合成线程是该帧的生产者，发布前完成 CPU cache 回写。
+        if (!combined_frame->syncForDevice())
+            continue;
+
+        if (streaming_enabled)
+        {
             StreamingData stream_data;
             stream_data.stream_id = 0;
-            stream_data.frame = frame_to_send;
-            stream_data.use_dma = false;
+            stream_data.dma_frame = combined_frame;
             stream_data.timestamp = std::chrono::system_clock::now();
             memset(&stream_data.person_results, 0,
                    sizeof(detect_result_group_t));
@@ -254,14 +275,6 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
             memset(&stream_data.callplay_results, 0,
                    sizeof(detect_result_group_t));
             streaming_manager.addStreamingData(stream_data);
-        }
-    }
-
-    for (auto& buffer : tile_buffers) {
-        if (buffer.fd >= 0) {
-            const size_t buffer_size =
-                static_cast<size_t>(buffer.width) * buffer.height * 3;
-            dma_buf_free(buffer_size, &buffer.fd, buffer.va);
         }
     }
 }
@@ -285,29 +298,40 @@ void rknn_infer(rknn_lite* person, rknn_lite* helmet, rknn_lite* tired,
     std::vector<FusedDetection> last_fused;
     bool first_input_logged = false;
     bool first_output_logged = false;
+    uint64_t last_sequence = 0;
 
-    while (!manager.stream_loaders[stream_index]->stopFlag) {
-        std::unique_lock<std::mutex> lock(
-            manager.stream_loaders[stream_index]->buffer.mtx);
-        if (manager.stream_loaders[stream_index]->buffer.img.empty()) {
-            lock.unlock();
+    while (!manager.stream_loaders[stream_index]->stopFlag)
+    {
+        auto &stream_buffer =
+            manager.stream_loaders[stream_index]->buffer;
+        std::shared_ptr<DmaImageBuffer> source_frame;
+        uint64_t sequence = 0;
+        {
+            std::lock_guard<std::mutex> lock(stream_buffer.mtx);
+            sequence = stream_buffer.sequence;
+            if (sequence != last_sequence)
+                source_frame = stream_buffer.dma_frame;
+        }
+        if (!source_frame)
+        {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
-        person->ori_img =
-            manager.stream_loaders[stream_index]->buffer.img.clone();
-        helmet->ori_img = person->ori_img.clone();
-        if (tired) {
-            tired->ori_img = person->ori_img.clone();
-        }
-        callplay->ori_img = person->ori_img.clone();
-        lock.unlock();
+        last_sequence = sequence;
+
+        // 四个模型共享源 DMA-BUF，各自的输入 tensor 也由 DMA-BUF 支撑。
+        person->setInputFrame(source_frame);
+        helmet->setInputFrame(source_frame);
+        if (tired)
+            tired->setInputFrame(source_frame);
+        callplay->setInputFrame(source_frame);
 
         if (!first_input_logged)
         {
             std::cout << "Inference stream " << stream_index
                       << " received first frame: "
-                      << person->ori_img.cols << "x" << person->ori_img.rows
+                      << source_frame->width() << "x"
+                      << source_frame->height()
                       << std::endl;
             first_input_logged = true;
         }
@@ -316,30 +340,39 @@ void rknn_infer(rknn_lite* person, rknn_lite* helmet, rknn_lite* tired,
         const bool do_infer =
             !has_inference_result ||
             ((frame_count - 1) % infer_interval == 0);
-        if (do_infer) {
+        if (do_infer)
+        {
             memset(&person_results, 0, sizeof(detect_result_group_t));
             memset(&helmet_results, 0, sizeof(detect_result_group_t));
             memset(&tired_results, 0, sizeof(detect_result_group_t));
             memset(&callplay_results, 0, sizeof(detect_result_group_t));
 
             auto person_future =
-                pool.submit([&]() { person->interf(person_results); });
+                pool.submit([&]() { return person->interf(person_results); });
             auto helmet_future =
-                pool.submit([&]() { helmet->interf(helmet_results); });
-            std::future<void> tired_future;
-            if (tired) {
+                pool.submit([&]() { return helmet->interf(helmet_results); });
+            std::future<int> tired_future;
+            if (tired)
+            {
                 tired_future =
-                    pool.submit([&]() { tired->interf(tired_results); });
+                    pool.submit([&]() { return tired->interf(tired_results); });
             }
             auto callplay_future =
-                pool.submit([&]() { callplay->interf(callplay_results); });
+                pool.submit([&]() { return callplay->interf(callplay_results); });
 
-            person_future.get();
-            helmet_future.get();
-            if (tired) {
-                tired_future.get();
+            int inference_status = person_future.get();
+            inference_status |= helmet_future.get();
+            if (tired)
+            {
+                inference_status |= tired_future.get();
             }
-            callplay_future.get();
+            inference_status |= callplay_future.get();
+            if (inference_status != 0)
+            {
+                std::cerr << "DMA RKNN inference failed on stream "
+                          << stream_index << std::endl;
+                continue;
+            }
 
             last_fused = fusion_manager.fuseDetections(
                 person_results, helmet_results, tired_results,
@@ -347,12 +380,17 @@ void rknn_infer(rknn_lite* person, rknn_lite* helmet, rknn_lite* tired,
             has_inference_result = true;
         }
 
-        if (draw_detections) {
+        if (draw_detections)
+        {
+            if (!source_frame->syncForCpu())
+                continue;
             fusion_manager.drawFusedDetections(person->ori_img, last_fused);
         }
+        if (!source_frame->syncForDevice())
+            continue;
         {
             std::lock_guard<std::mutex> image_lock(mutexes[stream_index]);
-            images[stream_index] = std::move(person->ori_img);
+            images[stream_index] = source_frame;
         }
 
         if (!first_output_logged)
@@ -443,6 +481,15 @@ int main(int argc, char* argv[])
     stream_config.draw_detections = app_config.streaming.draw_detections;
     const bool streaming_enabled =
         stream_config.enable_rtmp || stream_config.enable_rtsp;
+
+    if (streaming_enabled &&
+        (stream_config.width != kCompositeWidth ||
+         stream_config.height != kCompositeHeight))
+    {
+        std::cerr << "streaming width/height must match the fixed composite "
+                  << kCompositeWidth << "x" << kCompositeHeight << std::endl;
+        return -1;
+    }
 
     if (streaming_enabled &&
         !streaming_manager.initialize(stream_config)) {

@@ -7,22 +7,17 @@
  */
 
 #include "mpp_encoder.h"
-#include <opencv2/opencv.hpp>
-#include <opencv2/imgproc.hpp>
 #include "im2d.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <thread>
 #include <chrono>
 
 MppEncoder::MppEncoder()
     : mpp_ctx_(NULL), mpp_mpi_(NULL), enc_cfg_(NULL),
-      frame_(NULL), packet_(NULL), frm_grp_(NULL), pkt_grp_(NULL),
+      input_buffer_(NULL),
       width_(0), height_(0), fps_(0), bitrate_(0),
-      mpp_type_(MPP_VIDEO_CodingAVC), initialized_(false),
-      yuv_buffer_(NULL), yuv_buffer_size_(0) {
+      mpp_type_(MPP_VIDEO_CodingAVC), initialized_(false) {
 }
 
 MppEncoder::~MppEncoder() {
@@ -31,6 +26,7 @@ MppEncoder::~MppEncoder() {
 
 int MppEncoder::Init(int width, int height, int fps, int bitrate, int codec_type) {
     MPP_RET ret = MPP_OK;
+    MppBufferInfo input_info = {};
 
     width_ = width;
     height_ = height;
@@ -81,7 +77,7 @@ int MppEncoder::Init(int width, int height, int fps, int bitrate, int codec_type
     mpp_enc_cfg_set_s32(enc_cfg_, "prep:height", height);
     mpp_enc_cfg_set_s32(enc_cfg_, "prep:hor_stride", width);
     mpp_enc_cfg_set_s32(enc_cfg_, "prep:ver_stride", height);
-    mpp_enc_cfg_set_s32(enc_cfg_, "prep:format", MPP_FMT_YUV420P);
+    mpp_enc_cfg_set_s32(enc_cfg_, "prep:format", MPP_FMT_YUV420SP);
 
     // 码率控制：简单的 VBR 设置，偏向速度
     mpp_enc_cfg_set_s32(enc_cfg_, "rc:mode", MPP_ENC_RC_MODE_VBR);
@@ -117,36 +113,33 @@ int MppEncoder::Init(int width, int height, int fps, int bitrate, int codec_type
         goto FAIL;
     }
 
-    // 输入/输出缓冲区组
-    ret = mpp_buffer_group_get_internal(&frm_grp_, MPP_BUFFER_TYPE_ION);
-    if (ret != MPP_OK) {
-        fprintf(stderr, "failed to get buffer group for input frame ret %d\n", ret);
+    input_nv12_ = DmaImageBuffer::createNv12(width, height);
+    if (!input_nv12_) {
+        fprintf(stderr, "failed to allocate encoder NV12 DMA-BUF\n");
         goto FAIL;
     }
 
-    ret = mpp_buffer_group_get_internal(&pkt_grp_, MPP_BUFFER_TYPE_ION);
-    if (ret != MPP_OK) {
-        fprintf(stderr, "failed to get buffer group for output packet ret %d\n", ret);
-        goto FAIL;
-    }
-
-    // 预分配 YUV 缓冲区
-    yuv_buffer_size_ = width * height * 3 / 2;
-    yuv_buffer_ = (uint8_t*)malloc(yuv_buffer_size_);
-    if (!yuv_buffer_) {
-        fprintf(stderr, "failed to allocate YUV buffer (%d bytes)\n", yuv_buffer_size_);
+    input_info.type = MPP_BUFFER_TYPE_EXT_DMA;
+    input_info.size = input_nv12_->size();
+    input_info.ptr = input_nv12_->data();
+    input_info.fd = input_nv12_->fd();
+    ret = mpp_buffer_import(&input_buffer_, &input_info);
+    if (ret != MPP_OK || !input_buffer_) {
+        fprintf(stderr, "failed to import encoder DMA-BUF into MPP ret %d\n", ret);
         goto FAIL;
     }
 
     initialized_ = true;
+    fprintf(stdout, "MPP encoder DMA input ready: fd=%d, NV12 %dx%d\n",
+            input_nv12_->fd(), width_, height_);
     return 0;
 
 FAIL:
-    if (yuv_buffer_) {
-        free(yuv_buffer_);
-        yuv_buffer_ = NULL;
-        yuv_buffer_size_ = 0;
+    if (input_buffer_) {
+        mpp_buffer_put(input_buffer_);
+        input_buffer_ = NULL;
     }
+    input_nv12_.reset();
     if (enc_cfg_) {
         mpp_enc_cfg_deinit(enc_cfg_);
         enc_cfg_ = NULL;
@@ -159,56 +152,51 @@ FAIL:
     return -1;
 }
 
-int MppEncoder::EncodeFrame(uint8_t* bgr_data, int width, int height,
-                            uint8_t* packet_data, int* packet_size, int bgr_stride) {
-    return EncodeFrameDma((void*)bgr_data, width, height, packet_data, packet_size, bgr_stride);
-}
-
-int MppEncoder::EncodeFrameDma(void* bgr_va, int width, int height,
-                               uint8_t* packet_data, int* packet_size, int bgr_stride) {
+int MppEncoder::EncodeFrame(
+    const std::shared_ptr<DmaImageBuffer> &bgr_frame,
+    uint8_t *packet_data, int *packet_size) {
     if (!initialized_) {
         fprintf(stderr, "Encoder not initialized\n");
         return -1;
     }
 
-    if (width != width_ || height != height_) {
+    if (!bgr_frame || !bgr_frame->valid() ||
+        bgr_frame->format() != RK_FORMAT_BGR_888) {
+        fprintf(stderr, "Invalid BGR DMA-BUF passed to encoder\n");
+        return -1;
+    }
+    if (bgr_frame->width() != width_ || bgr_frame->height() != height_) {
         fprintf(stderr, "Frame size mismatch: %dx%d vs %dx%d\n",
-                width, height, width_, height_);
+                bgr_frame->width(), bgr_frame->height(), width_, height_);
+        return -1;
+    }
+    if (!input_nv12_ || !input_buffer_ ||
+        !bgr_frame->syncForDevice() || !input_nv12_->syncForDevice()) {
+        fprintf(stderr, "Encoder DMA-BUF is unavailable\n");
         return -1;
     }
 
-    if (!yuv_buffer_ || yuv_buffer_size_ < width * height * 3 / 2) {
-        fprintf(stderr, "YUV buffer not allocated or too small\n");
-        return -1;
-    }
-
-    int wstride_pix = (bgr_stride > 0) ? (bgr_stride / 3) : width;
-    int hstride_pix = height;
-    rga_buffer_t src_buf = wrapbuffer_virtualaddr_t(bgr_va, width, height, wstride_pix, hstride_pix, RK_FORMAT_BGR_888);
-    rga_buffer_t dst_buf = wrapbuffer_virtualaddr_t((void*)yuv_buffer_, width, height, width, height, RK_FORMAT_YCbCr_420_P);
-
-    IM_STATUS status = imcvtcolor(src_buf, dst_buf,
-                                  RK_FORMAT_BGR_888, RK_FORMAT_YCbCr_420_P,
-                                  IM_COLOR_SPACE_DEFAULT);
+    rga_buffer_t source = wrapbuffer_handle_t(
+        bgr_frame->rgaHandle(), bgr_frame->width(), bgr_frame->height(),
+        bgr_frame->widthStride(), bgr_frame->heightStride(),
+        RK_FORMAT_BGR_888);
+    rga_buffer_t destination = wrapbuffer_handle_t(
+        input_nv12_->rgaHandle(), width_, height_,
+        input_nv12_->widthStride(), input_nv12_->heightStride(),
+        RK_FORMAT_YCbCr_420_SP);
+    const IM_STATUS status = imcvtcolor(
+        source, destination, RK_FORMAT_BGR_888,
+        RK_FORMAT_YCbCr_420_SP, IM_RGB_TO_YUV_BT601_LIMIT);
     if (status != IM_STATUS_SUCCESS) {
-        static int fallback_count = 0;
-        if (fallback_count++ < 3) {
-            fprintf(stderr, "RGA color conversion failed (%d), using OpenCV fallback\n", (int)status);
-        }
-        int row_stride = (bgr_stride > 0) ? bgr_stride : (width * 3);
-        cv::Mat bgr(height, width, CV_8UC3, bgr_va, row_stride);
-        if (!bgr.isContinuous()) {
-            bgr = bgr.clone();
-        }
-        cv::Mat yuv(height * 3 / 2, width, CV_8UC1, yuv_buffer_);
-        cv::cvtColor(bgr, yuv, cv::COLOR_BGR2YUV_I420);
+        fprintf(stderr, "RGA DMA BGR->NV12 conversion failed (%d: %s)\n",
+                static_cast<int>(status), imStrError_t(status));
+        return -1;
     }
 
-    int yuv_size = width * height * 3 / 2;
-    return Encode(yuv_buffer_, yuv_size, packet_data, packet_size);
+    return EncodeNv12(packet_data, packet_size);
 }
 
-int MppEncoder::Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, int* packet_size) {
+int MppEncoder::EncodeNv12(uint8_t *packet_data, int *packet_size) {
     if (!initialized_) {
         fprintf(stderr, "Encoder not initialized\n");
         return -1;
@@ -217,7 +205,6 @@ int MppEncoder::Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, in
     MPP_RET ret = MPP_OK;
     MppFrame frame = NULL;
     MppPacket packet = NULL;
-    MppBuffer buffer = NULL;
 
     ret = mpp_frame_init(&frame);
     if (ret != MPP_OK) {
@@ -225,35 +212,17 @@ int MppEncoder::Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, in
         return -1;
     }
 
-    int buf_size = width_ * height_ * 3 / 2;
-    ret = mpp_buffer_get(frm_grp_, &buffer, buf_size);
-    if (ret != MPP_OK) {
-        fprintf(stderr, "failed to get buffer for input frame ret %d\n", ret);
-        mpp_frame_deinit(&frame);
-        return -1;
-    }
-
-    void* buf_ptr = mpp_buffer_get_ptr(buffer);
-    if (!buf_ptr) {
-        fprintf(stderr, "failed to get buffer pointer\n");
-        mpp_buffer_put(buffer);
-        mpp_frame_deinit(&frame);
-        return -1;
-    }
-    memcpy(buf_ptr, yuv_data, yuv_size);
-
     mpp_frame_set_width(frame, width_);
     mpp_frame_set_height(frame, height_);
     mpp_frame_set_hor_stride(frame, width_);
     mpp_frame_set_ver_stride(frame, height_);
-    mpp_frame_set_fmt(frame, MPP_FMT_YUV420P);
-    mpp_frame_set_buffer(frame, buffer);
+    mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
+    mpp_frame_set_buffer(frame, input_buffer_);
     mpp_frame_set_eos(frame, 0);
 
     ret = mpp_mpi_->encode_put_frame(mpp_ctx_, frame);
     if (ret != MPP_OK) {
         fprintf(stderr, "encode_put_frame failed ret %d\n", ret);
-        mpp_buffer_put(buffer);
         mpp_frame_deinit(&frame);
         return -1;
     }
@@ -267,7 +236,6 @@ int MppEncoder::Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, in
         }
         if (ret != MPP_ERR_TIMEOUT) {
             *packet_size = 0;
-            mpp_buffer_put(buffer);
             mpp_frame_deinit(&frame);
             return 0;
         }
@@ -275,7 +243,6 @@ int MppEncoder::Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, in
     }
     if (ret != MPP_OK || !packet) {
         *packet_size = 0;
-        mpp_buffer_put(buffer);
         mpp_frame_deinit(&frame);
         return 0;
     }
@@ -290,7 +257,6 @@ int MppEncoder::Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, in
         } else {
             *packet_size = 0;
             mpp_packet_deinit(&packet);
-            mpp_buffer_put(buffer);
             mpp_frame_deinit(&frame);
             return -1;
         }
@@ -299,7 +265,6 @@ int MppEncoder::Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, in
     }
 
     mpp_packet_deinit(&packet);
-    mpp_buffer_put(buffer);
     mpp_frame_deinit(&frame);
 
     return 0;
@@ -348,25 +313,15 @@ void MppEncoder::Release() {
         enc_cfg_ = NULL;
     }
 
-    if (frm_grp_) {
-        mpp_buffer_group_put(frm_grp_);
-        frm_grp_ = NULL;
+    if (input_buffer_) {
+        mpp_buffer_put(input_buffer_);
+        input_buffer_ = NULL;
     }
-
-    if (pkt_grp_) {
-        mpp_buffer_group_put(pkt_grp_);
-        pkt_grp_ = NULL;
-    }
+    input_nv12_.reset();
 
     if (mpp_ctx_) {
         mpp_destroy(mpp_ctx_);
         mpp_ctx_ = NULL;
-    }
-
-    if (yuv_buffer_) {
-        free(yuv_buffer_);
-        yuv_buffer_ = NULL;
-        yuv_buffer_size_ = 0;
     }
 
     initialized_ = false;

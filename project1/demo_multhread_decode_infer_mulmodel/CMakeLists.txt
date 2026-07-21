@@ -95,6 +95,7 @@ include_directories(
 set(DEMO_LIB_SOURCES
     ${PROJECT_ROOT}/lib/app_config.cpp
     ${PROJECT_ROOT}/lib/detection_fusion_manager.cpp
+    ${PROJECT_ROOT}/lib/dma_image.cpp
     ${PROJECT_ROOT}/lib/mpp_decoder.cpp
     ${PROJECT_ROOT}/lib/mpp_encoder.cpp
     ${PROJECT_ROOT}/lib/postprocess.cpp

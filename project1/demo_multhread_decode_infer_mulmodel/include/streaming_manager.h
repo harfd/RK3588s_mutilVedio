@@ -12,19 +12,15 @@
 #include <mutex>
 #include <queue>
 #include <atomic>
+#include <memory>
+#include <vector>
 #include "postprocess.h"
 #include <condition_variable>
 #include "mpp_encoder.h"
 // 推流数据结构
 struct StreamingData {
     int stream_id;
-    cv::Mat frame;
-    bool use_dma = false;
-    int frame_fd = -1;
-    void* frame_va = nullptr;
-    int frame_width = 0;
-    int frame_height = 0;
-    int frame_stride = 0;
+    std::shared_ptr<DmaImageBuffer> dma_frame;
     detect_result_group_t person_results;    // 人员检测结果
     detect_result_group_t helmet_results;   // 安全帽检测结果
     detect_result_group_t tired_results;    // 疲劳检测结果
@@ -86,7 +82,7 @@ private:
     
     // RTMP推流相关
     bool initializeRTMP();
-    bool sendRTMPFrame(const cv::Mat& frame);
+    bool sendRTMPFrame(const std::shared_ptr<DmaImageBuffer> &frame);
     
     // RTSP推流相关
     bool initializeRTSP();
@@ -110,6 +106,7 @@ private:
     // 使用 MPP 进行硬编码，不再使用 FFmpeg 软编码
     MppEncoder* mpp_encoder_ = nullptr;
     int64_t     rtmp_frame_index_ = 0;
+    std::vector<uint8_t> encoded_buffer_;
     
     // 统计信息
     mutable std::mutex stats_mutex_;

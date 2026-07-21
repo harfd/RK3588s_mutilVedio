@@ -247,8 +247,21 @@ int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos)
                     if (callback != nullptr)
                     {
                         MppFrameFormat format = mpp_frame_get_fmt(frame);
-                        char *data_vir = (char *)mpp_buffer_get_ptr(mpp_frame_get_buffer(frame));
-                        callback(this->userdata, hor_stride, ver_stride, hor_width, ver_height, format, 0, data_vir,this->id);
+                        MppBuffer frame_buffer = mpp_frame_get_buffer(frame);
+                        if (!frame_buffer)
+                        {
+                            fprintf(stderr, "MPP returned a frame without a buffer\n");
+                        }
+                        else
+                        {
+                            char *data_vir =
+                                (char *)mpp_buffer_get_ptr(frame_buffer);
+                            int frame_fd = mpp_buffer_get_fd(frame_buffer);
+                            size_t frame_size = mpp_buffer_get_size(frame_buffer);
+                            callback(this->userdata, hor_stride, ver_stride,
+                                     hor_width, ver_height, format, frame_fd,
+                                     data_vir, frame_size, this->id);
+                        }
                     }
                 }
                 frm_eos = mpp_frame_get_eos(frame);

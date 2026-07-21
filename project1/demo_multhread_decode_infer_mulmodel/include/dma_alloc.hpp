@@ -135,6 +135,7 @@ static int dma_buf_alloc(const char *path, size_t size, int *fd, void **va) {
     ret = ioctl(dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &buf_data);
     if (ret < 0) {
         printf("RK_DMA_HEAP_ALLOC_BUFFER failed\n");
+        close(dma_heap_fd);
         return ret;
     }
 
@@ -148,6 +149,8 @@ static int dma_buf_alloc(const char *path, size_t size, int *fd, void **va) {
     mmap_va = (void *)mmap(NULL, buf_data.len, prot, MAP_SHARED, buf_data.fd, 0);
     if (mmap_va == MAP_FAILED) {
         printf("mmap failed: %s\n", strerror(errno));
+        close(buf_data.fd);
+        close(dma_heap_fd);
         return -errno;
     }
 
@@ -160,10 +163,7 @@ static int dma_buf_alloc(const char *path, size_t size, int *fd, void **va) {
 }
 
 static void dma_buf_free(size_t size, int *fd, void *va) {
-    int len;
-
-    len =  size;
-    munmap(va, len);
+    munmap(va, size);
 
     close(*fd);
     *fd = -1;

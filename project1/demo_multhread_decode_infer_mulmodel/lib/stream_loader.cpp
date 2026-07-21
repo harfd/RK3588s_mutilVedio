@@ -29,55 +29,131 @@ int is_annexb(const uint8_t *buf, size_t buf_size)
 }
 
 
-void mpp_decoder_frame_callback(void *buffer, int width_stride, int height_stride, int width, int height, int format, int fd, void *data, int id)
+void mpp_decoder_frame_callback(void *buffer, int width_stride,
+                                int height_stride, int width, int height,
+                                int format, int fd, void *data,
+                                size_t buffer_size, int id)
 {
     Mbuffer *mbuffer = (Mbuffer *)buffer;
-    size_t yuv_size = (size_t)width * height * 3 / 2;
-
-    mbuffer->yuv_work.resize(yuv_size);
-    uint8_t *yuv_data = mbuffer->yuv_work.data();
-
-    uint8_t *base_y = (uint8_t *)data;
-    uint8_t *base_c = base_y + (size_t)width_stride * height_stride;
-    int idx = 0;
-
-    for (int i = 0; i < height; i++, base_y += width_stride)
+    const int mpp_format = format & MPP_FRAME_FMT_MASK;
+    int rga_yuv_format = 0;
+    int opencv_conversion = -1;
+    if (mpp_format == MPP_FMT_YUV420SP)
     {
-        memcpy(yuv_data + idx, base_y, width);
-        idx += width;
+        rga_yuv_format = RK_FORMAT_YCbCr_420_SP;
+        opencv_conversion = cv::COLOR_YUV2BGR_NV12;
     }
-
-    for (int i = 0; i < height / 2; i++, base_c += width_stride)
+    else if (mpp_format == MPP_FMT_YUV420SP_VU)
     {
-        memcpy(yuv_data + idx, base_c, width);
-        idx += width;
+        rga_yuv_format = RK_FORMAT_YCrCb_420_SP;
+        opencv_conversion = cv::COLOR_YUV2BGR_NV21;
     }
-
-    mbuffer->bgr_work.create(height, width, CV_8UC3);
-    if (mbuffer->bgr_work.empty()) {
+    else
+    {
+        fprintf(stderr, "Unsupported MPP output format %d on stream %d\n",
+                mpp_format, id);
         return;
     }
 
-    // 优先使用 RGA 硬件加速 NV12->BGR，失败则回退 OpenCV
-    rga_buffer_t src_buf = wrapbuffer_virtualaddr_t(yuv_data, width, height, width, height, RK_FORMAT_YCbCr_420_SP);
-    rga_buffer_t dst_buf = wrapbuffer_virtualaddr_t(mbuffer->bgr_work.data, width, height, width, height, RK_FORMAT_BGR_888);
-
-    IM_STATUS status = imcvtcolor(src_buf, dst_buf,
-                                  RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888,
-                                  IM_COLOR_SPACE_DEFAULT);
-
-    if (status != IM_STATUS_SUCCESS) {
-        static int fallback_count = 0;
-        if (fallback_count++ < 3) {
-            fprintf(stderr, "RGA NV12->BGR failed (%d), using OpenCV fallback\n", (int)status);
-        }
-        cv::Mat yuvMat(height + height / 2, width, CV_8UC1, yuv_data);
-        cv::cvtColor(yuvMat, mbuffer->bgr_work, cv::COLOR_YUV2BGR_NV12);
+    if (!mbuffer->dma_pool)
+    {
+        std::lock_guard<std::mutex> lock(mbuffer->mtx);
+        if (!mbuffer->dma_pool)
+            mbuffer->dma_pool.reset(new DmaImagePool());
     }
 
-    std::unique_lock<std::mutex> mlock(mbuffer->mtx);
-    mbuffer->img = std::move(mbuffer->bgr_work);
-    mlock.unlock();
+    const size_t bgr_size = static_cast<size_t>(width) * height * 3;
+    if (!mbuffer->dma_pool->configure(
+            4, width, height, width, height,
+            RK_FORMAT_BGR_888, bgr_size))
+    {
+        fprintf(stderr, "Failed to configure decoded-frame DMA pool for stream %d\n",
+                id);
+        return;
+    }
+
+    auto output_frame = mbuffer->dma_pool->acquire();
+    if (!output_frame)
+    {
+        static std::atomic<unsigned int> dropped_frames{0};
+        const unsigned int dropped = ++dropped_frames;
+        if (dropped == 1 || dropped % 100 == 0)
+            fprintf(stderr,
+                    "Decoded-frame DMA pool is busy; dropped %u frame(s)\n",
+                    dropped);
+        return;
+    }
+
+    // 正常路径：MPP DMA-BUF fd -> RGA -> BGR DMA-BUF，不复制原始图像。
+    bool converted = false;
+    if (fd >= 0 && buffer_size > 0)
+    {
+        const uint32_t source_handle = importbuffer_fd(
+            fd, static_cast<int>(buffer_size));
+        if (source_handle != 0)
+        {
+            rga_buffer_t src_buf = wrapbuffer_handle_t(
+                source_handle, width, height,
+                width_stride, height_stride, rga_yuv_format);
+            rga_buffer_t dst_buf = wrapbuffer_handle_t(
+                output_frame->rgaHandle(), width, height,
+                output_frame->widthStride(), output_frame->heightStride(),
+                RK_FORMAT_BGR_888);
+            const IM_STATUS status = imcvtcolor(
+                src_buf, dst_buf, rga_yuv_format, RK_FORMAT_BGR_888,
+                IM_YUV_TO_RGB_BT601_LIMIT);
+            releasebuffer_handle(source_handle);
+            if (status == IM_STATUS_SUCCESS)
+                converted = true;
+            else
+                fprintf(stderr,
+                        "RGA MPP fd->BGR conversion failed on stream %d "
+                        "(%d: %s); using CPU fallback for this frame\n",
+                        id, static_cast<int>(status), imStrError_t(status));
+        }
+    }
+
+    if (!converted)
+    {
+        const size_t padded_size =
+            static_cast<size_t>(width_stride) * height_stride * 3 / 2;
+        if (!data || buffer_size < padded_size ||
+            !output_frame->syncForCpu())
+            return;
+
+        // 回退只用于排障和兼容异常驱动，正常 RGA 路径不会执行这些复制。
+        const size_t yuv_size = static_cast<size_t>(width) * height * 3 / 2;
+        mbuffer->yuv_work.resize(yuv_size);
+        uint8_t *yuv_data = mbuffer->yuv_work.data();
+        uint8_t *base_y = static_cast<uint8_t *>(data);
+        uint8_t *base_c = base_y +
+                          static_cast<size_t>(width_stride) * height_stride;
+        size_t offset = 0;
+        for (int row = 0; row < height; ++row, base_y += width_stride)
+        {
+            memcpy(yuv_data + offset, base_y, width);
+            offset += width;
+        }
+        for (int row = 0; row < height / 2; ++row, base_c += width_stride)
+        {
+            memcpy(yuv_data + offset, base_c, width);
+            offset += width;
+        }
+
+        cv::Mat yuv_mat(height + height / 2, width, CV_8UC1, yuv_data);
+        cv::cvtColor(yuv_mat, output_frame->bgrView(), opencv_conversion);
+    }
+    bool first_dma_frame = false;
+    {
+        std::lock_guard<std::mutex> lock(mbuffer->mtx);
+        first_dma_frame = mbuffer->sequence == 0;
+        mbuffer->dma_frame = output_frame;
+        ++mbuffer->sequence;
+    }
+    if (first_dma_frame)
+        fprintf(stdout,
+                "MPP stream %d DMA output ready: fd=%d, BGR %dx%d\n",
+                id, output_frame->fd(), width, height);
 
     // 每输出一帧限速，解决一包多帧导致的倍速
     if (mbuffer->throttle && mbuffer->frame_interval_ms > 0)
@@ -88,9 +164,10 @@ void StreamLoader::close()
 {
     if (is_v4l2_camera_)
     {
-        std::lock_guard<std::mutex> lock(buffer.mtx);
-        buffer.img.release();
         camera_.close();
+        std::lock_guard<std::mutex> lock(buffer.mtx);
+        buffer.dma_frame.reset();
+        buffer.dma_pool.reset();
         return;
     }
 
@@ -120,6 +197,10 @@ void StreamLoader::close()
     {
         av_dict_free(&options);
     }
+
+    std::lock_guard<std::mutex> lock(buffer.mtx);
+    buffer.dma_frame.reset();
+    buffer.dma_pool.reset();
 }
 
 bool StreamLoader::read_frame()
@@ -237,7 +318,8 @@ int StreamLoader::open()
 
         const int ret = camera_.open(stream_url_, source_.width,
                                      source_.height, source_.fps,
-                                     source_.chroma_order == "vu");
+                                     source_.chroma_order == "vu",
+                                     source_.auto_white_balance);
         status = ret;
         if (ret == 0)
         {

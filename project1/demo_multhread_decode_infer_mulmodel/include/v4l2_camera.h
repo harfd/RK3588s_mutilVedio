@@ -27,7 +27,7 @@ public:
 
     int open(const std::string &device_path, int requested_width = 0,
              int requested_height = 0, int requested_fps = 0,
-             bool use_nv21 = false);
+             bool use_nv21 = false, bool auto_white_balance = false);
     bool captureFrame(Mbuffer &output, const std::atomic<bool> &stop_flag);
     void close();
 
@@ -41,6 +41,7 @@ private:
         int fd = -1;
         void *va = nullptr;
         size_t size = 0;
+        uint32_t rga_handle = 0;
     };
 
     static constexpr int kDefaultRequestedWidth = 4224;
@@ -53,6 +54,7 @@ private:
     int allocateBuffers();
     int queueBuffer(uint32_t index);
     bool processBuffer(uint32_t index, Mbuffer &output);
+    void applyAutoWhiteBalance(cv::Mat &image);
     void releaseBuffer(DmaBuffer &buffer);
 
     int camera_fd_ = -1;
@@ -71,12 +73,11 @@ private:
     int requested_fps_ = 0;
     bool use_nv21_ = false;
     bool full_range_ = false;
+    bool auto_white_balance_ = false;
+    cv::Vec3f white_balance_gains_ = cv::Vec3f(1.0f, 1.0f, 1.0f);
 
     std::vector<DmaBuffer> capture_buffers_;
     DmaBuffer scaled_nv12_;
-    DmaBuffer output_bgr_;
-    cv::Mat output_bgr_view_;
-    bool output_cpu_access_active_ = false;
     uint64_t captured_frame_count_ = 0;
     uint32_t poll_timeout_count_ = 0;
 };

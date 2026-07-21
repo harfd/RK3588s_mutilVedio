@@ -11,6 +11,7 @@
 #include "dma_alloc.hpp"
 #include "im2d.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -46,7 +47,7 @@ V4L2Camera::~V4L2Camera()
 
 int V4L2Camera::open(const std::string &device_path, int requested_width,
                      int requested_height, int requested_fps,
-                     bool use_nv21)
+                     bool use_nv21, bool auto_white_balance)
 {
     close();
     device_path_ = device_path;
@@ -58,6 +59,8 @@ int V4L2Camera::open(const std::string &device_path, int requested_width,
                             : kDefaultRequestedHeight;
     requested_fps_ = requested_fps;
     use_nv21_ = use_nv21;
+    auto_white_balance_ = auto_white_balance;
+    white_balance_gains_ = cv::Vec3f(1.0f, 1.0f, 1.0f);
 
     camera_fd_ = ::open(device_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (camera_fd_ < 0)
@@ -107,6 +110,7 @@ int V4L2Camera::open(const std::string &device_path, int requested_width,
               << ", output=" << kOutputWidth << "x" << kOutputHeight
               << ", chroma=" << (use_nv21_ ? "VU(NV21)" : "UV(NV12)")
               << ", range=" << (full_range_ ? "full" : "limited")
+              << ", auto_wb=" << (auto_white_balance_ ? "on" : "off")
               << std::endl;
     return 0;
 }
@@ -269,6 +273,13 @@ int V4L2Camera::allocateBuffers()
                       << DMA_HEAP_PATH << std::endl;
             return ret;
         }
+        buffer.rga_handle = importbuffer_fd(
+            buffer.fd, static_cast<int>(buffer.size));
+        if (buffer.rga_handle == 0)
+        {
+            std::cerr << "Failed to import camera DMA-BUF into RGA" << std::endl;
+            return -EIO;
+        }
     }
 
     scaled_nv12_.size = static_cast<size_t>(kOutputWidth) * kOutputHeight * 3 / 2;
@@ -276,14 +287,14 @@ int V4L2Camera::allocateBuffers()
                             &scaled_nv12_.fd, &scaled_nv12_.va);
     if (ret < 0)
         return ret;
+    scaled_nv12_.rga_handle = importbuffer_fd(
+        scaled_nv12_.fd, static_cast<int>(scaled_nv12_.size));
+    if (scaled_nv12_.rga_handle == 0)
+    {
+        std::cerr << "Failed to import scaled NV12 DMA-BUF into RGA" << std::endl;
+        return -EIO;
+    }
 
-    output_bgr_.size = static_cast<size_t>(kOutputWidth) * kOutputHeight * 3;
-    ret = dma_buf_alloc(DMA_HEAP_PATH, output_bgr_.size,
-                        &output_bgr_.fd, &output_bgr_.va);
-    if (ret < 0)
-        return ret;
-
-    output_bgr_view_ = cv::Mat(kOutputHeight, kOutputWidth, CV_8UC3, output_bgr_.va);
     return 0;
 }
 
@@ -396,7 +407,11 @@ bool V4L2Camera::captureFrame(Mbuffer &output, const std::atomic<bool> &stop_fla
                       << kOutputWidth << "x" << kOutputHeight << std::endl;
         }
     }
-    return processed && queue_ret == 0;
+    if (queue_ret != 0)
+        return false;
+
+    // RGA 瞬时繁忙只丢弃当前帧，不重启整个 V4L2 设备。
+    return true;
 }
 
 bool V4L2Camera::processBuffer(uint32_t index, Mbuffer &output)
@@ -404,13 +419,13 @@ bool V4L2Camera::processBuffer(uint32_t index, Mbuffer &output)
     const int yuv_format = use_nv21_
                                ? RK_FORMAT_YCrCb_420_SP
                                : RK_FORMAT_YCbCr_420_SP;
-    rga_buffer_t source = wrapbuffer_fd_t(
-        capture_buffers_[index].fd,
+    rga_buffer_t source = wrapbuffer_handle_t(
+        capture_buffers_[index].rga_handle,
         source_width_, source_height_,
         source_stride_, source_height_,
         yuv_format);
-    rga_buffer_t scaled = wrapbuffer_fd_t(
-        scaled_nv12_.fd,
+    rga_buffer_t scaled = wrapbuffer_handle_t(
+        scaled_nv12_.rga_handle,
         kOutputWidth, kOutputHeight,
         kOutputWidth, kOutputHeight,
         yuv_format);
@@ -419,22 +434,40 @@ bool V4L2Camera::processBuffer(uint32_t index, Mbuffer &output)
     if (status != IM_STATUS_SUCCESS)
     {
         std::cerr << "RGA camera YUV resize failed: "
-                  << imStrError(status) << std::endl;
+                  << imStrError_t(status) << std::endl;
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(output.mtx);
-    if (output_cpu_access_active_)
+    if (!output.dma_pool)
     {
-        if (dma_sync_cpu_to_device(output_bgr_.fd) < 0)
-            logErrno("DMA_BUF_SYNC_END", device_path_);
-        output_cpu_access_active_ = false;
+        std::lock_guard<std::mutex> lock(output.mtx);
+        if (!output.dma_pool)
+            output.dma_pool.reset(new DmaImagePool());
     }
 
-    rga_buffer_t bgr = wrapbuffer_fd_t(
-        output_bgr_.fd,
+    const size_t bgr_size =
+        static_cast<size_t>(kOutputWidth) * kOutputHeight * 3;
+    if (!output.dma_pool->configure(
+            4, kOutputWidth, kOutputHeight,
+            kOutputWidth, kOutputHeight,
+            RK_FORMAT_BGR_888, bgr_size))
+        return false;
+
+    auto output_frame = output.dma_pool->acquire();
+    if (!output_frame)
+    {
+        static uint64_t dropped_frames = 0;
+        ++dropped_frames;
+        if (dropped_frames == 1 || dropped_frames % 100 == 0)
+            std::cerr << "Camera output DMA pool is busy; dropped "
+                      << dropped_frames << " frame(s)" << std::endl;
+        return false;
+    }
+
+    rga_buffer_t bgr = wrapbuffer_handle_t(
+        output_frame->rgaHandle(),
         kOutputWidth, kOutputHeight,
-        kOutputWidth, kOutputHeight,
+        output_frame->widthStride(), output_frame->heightStride(),
         RK_FORMAT_BGR_888);
     status = imcvtcolor(scaled, bgr,
                         yuv_format, RK_FORMAT_BGR_888,
@@ -443,22 +476,75 @@ bool V4L2Camera::processBuffer(uint32_t index, Mbuffer &output)
     if (status != IM_STATUS_SUCCESS)
     {
         std::cerr << "RGA camera YUV to BGR failed: "
-                  << imStrError(status) << std::endl;
+                  << imStrError_t(status) << std::endl;
         return false;
     }
 
-    if (dma_sync_device_to_cpu(output_bgr_.fd) < 0)
+    if (auto_white_balance_)
     {
-        logErrno("DMA_BUF_SYNC_START", device_path_);
-        return false;
+        if (!output_frame->syncForCpu())
+            return false;
+        cv::Mat output_view = output_frame->bgrView();
+        applyAutoWhiteBalance(output_view);
     }
-    output_cpu_access_active_ = true;
-    output.img = output_bgr_view_;
+    // 生产者在发布前结束 CPU 访问，保证后续 RGA/RKNN 直接读取到最新数据。
+    if (!output_frame->syncForDevice())
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(output.mtx);
+        output.dma_frame = output_frame;
+        ++output.sequence;
+    }
     return true;
+}
+
+void V4L2Camera::applyAutoWhiteBalance(cv::Mat &image)
+{
+    cv::Mat sample;
+    cv::resize(image, sample, cv::Size(160, 120), 0.0, 0.0,
+               cv::INTER_AREA);
+    const cv::Scalar means = cv::mean(sample);
+    const double gray = (means[0] + means[1] + means[2]) / 3.0;
+    if (gray < 1.0)
+        return;
+
+    cv::Vec3f target_gains;
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        const float gain = static_cast<float>(
+            gray / std::max(means[channel], 1.0));
+        target_gains[channel] = std::max(0.70f, std::min(1.40f, gain));
+    }
+
+    const float smoothing = captured_frame_count_ < 10 ? 0.25f : 0.05f;
+    white_balance_gains_ =
+        white_balance_gains_ * (1.0f - smoothing) +
+        target_gains * smoothing;
+
+    if (captured_frame_count_ == 0 ||
+        (captured_frame_count_ + 1) % 100 == 0)
+    {
+        std::cout << "Camera auto-WB gains B/G/R="
+                  << white_balance_gains_[0] << "/"
+                  << white_balance_gains_[1] << "/"
+                  << white_balance_gains_[2] << std::endl;
+    }
+
+    const cv::Matx33f correction(
+        white_balance_gains_[0], 0.0f, 0.0f,
+        0.0f, white_balance_gains_[1], 0.0f,
+        0.0f, 0.0f, white_balance_gains_[2]);
+    cv::transform(image, image, correction);
 }
 
 void V4L2Camera::releaseBuffer(DmaBuffer &buffer)
 {
+    if (buffer.rga_handle > 0)
+    {
+        releasebuffer_handle(buffer.rga_handle);
+        buffer.rga_handle = 0;
+    }
     if (buffer.fd >= 0)
         dma_buf_free(buffer.size, &buffer.fd, buffer.va);
     buffer.va = nullptr;
@@ -467,12 +553,6 @@ void V4L2Camera::releaseBuffer(DmaBuffer &buffer)
 
 void V4L2Camera::close()
 {
-    if (output_cpu_access_active_ && output_bgr_.fd >= 0)
-    {
-        dma_sync_cpu_to_device(output_bgr_.fd);
-        output_cpu_access_active_ = false;
-    }
-
     if (camera_fd_ >= 0 && streaming_)
     {
         enum v4l2_buf_type type = static_cast<enum v4l2_buf_type>(buffer_type_);
@@ -494,8 +574,6 @@ void V4L2Camera::close()
         releaseBuffer(buffer);
     capture_buffers_.clear();
     releaseBuffer(scaled_nv12_);
-    releaseBuffer(output_bgr_);
-    output_bgr_view_.release();
 
     if (camera_fd_ >= 0)
     {

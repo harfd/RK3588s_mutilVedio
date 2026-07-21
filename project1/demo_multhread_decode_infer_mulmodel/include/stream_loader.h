@@ -34,9 +34,6 @@ using std::vector;
 #include "m_buffer.hpp"
 
 
-using MppDecoderFrameCallback = std::function<void(void *userdata, int width_stride, int height_stride, int width, int height, int format, int fd, void *data, int id)>;
-
-
 class StreamLoader
 {
 public:

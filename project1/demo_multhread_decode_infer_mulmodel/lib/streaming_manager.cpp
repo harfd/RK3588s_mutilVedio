@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <cstring>
 #include <chrono>
+#include <utility>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -86,21 +87,30 @@ bool StreamingManager::initialize(const StreamingConfig& config) {
 }
 
 void StreamingManager::addStreamingData(const StreamingData& data) {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    
-    // 限制队列大小，避免内存溢出
-    if (streaming_queue_.size() > 10) {
-        streaming_queue_.pop(); // 丢弃最旧的数据
-        stats_.frames_dropped++;
+    size_t dropped = 0;
+    size_t queue_size = 0;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        // 实时视频只保留最新画面，禁止旧帧在网络恢复后继续排队发送。
+        while (!streaming_queue_.empty()) {
+            streaming_queue_.pop();
+            ++dropped;
+        }
+        streaming_queue_.push(data);
+        queue_size = streaming_queue_.size();
     }
-    
-    streaming_queue_.push(data);
     queue_cv_.notify_one();
+
+    if (dropped > 0) {
+        std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+        stats_.frames_dropped += static_cast<int>(dropped);
+    }
     
     // 调试信息：每100帧打印一次
     static int frame_count = 0;
     if (++frame_count % 100 == 0) {
-        std::cout << "Added frame to streaming queue, queue size: " << streaming_queue_.size() << std::endl;
+        std::cout << "Added frame to streaming queue, queue size: "
+                  << queue_size << std::endl;
     }
 }
 
@@ -117,18 +127,16 @@ void StreamingManager::startStreaming() {
 }
 
 void StreamingManager::stopStreaming() {
-    if (!streaming_active_.load()) {
-        return;
+    if (streaming_active_.load()) {
+        should_stop_ = true;
+        queue_cv_.notify_all();
+
+        if (streaming_thread_.joinable()) {
+            streaming_thread_.join();
+        }
+
+        streaming_active_ = false;
     }
-    
-    should_stop_ = true;
-    queue_cv_.notify_all();
-    
-    if (streaming_thread_.joinable()) {
-        streaming_thread_.join();
-    }
-    
-    streaming_active_ = false;
     
     // 清理FFmpeg / MPP 资源
     if (avformat_context_) {
@@ -146,77 +154,59 @@ void StreamingManager::stopStreaming() {
         delete mpp_encoder_;
         mpp_encoder_ = nullptr;
     }
+    encoded_buffer_.clear();
     
     std::cout << "Streaming stopped" << std::endl;
 }
 
 void StreamingManager::streamingWorker() {
-    cv::Mat last_frame;  // 保存最后一帧，用于超时情况
-    bool has_last_frame = false;
-    
     while (!should_stop_.load()) {
         StreamingData data;
-        bool got_data = false;
-        
-        // 等待数据，使用超时机制防止连接超时
+
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            auto timeout = std::chrono::milliseconds(1000 / config_.fps);  // 按帧率计算超时时间
-            if (queue_cv_.wait_for(lock, timeout, [this] { 
-                return !streaming_queue_.empty() || should_stop_.load(); 
-            })) {
-                if (should_stop_.load()) {
-                    break;
-                }
-                
-                if (!streaming_queue_.empty()) {
-                    data = streaming_queue_.front();
-                    streaming_queue_.pop();
-                    got_data = true;
-                }
-            } else {
-                if (has_last_frame && !last_frame.empty()) {
-                    data.frame = last_frame.clone();
-                    data.stream_id = 0;
-                    data.timestamp = std::chrono::system_clock::now();
-                    memset(&data.person_results, 0, sizeof(detect_result_group_t));
-                    memset(&data.helmet_results, 0, sizeof(detect_result_group_t));
-                    memset(&data.tired_results, 0, sizeof(detect_result_group_t));
-                    memset(&data.callplay_results, 0, sizeof(detect_result_group_t));
-                    got_data = true;
-                } else {
-                    continue;
-                }
-            }
-        }
-        
-        if (!got_data) {
-            continue;
-        }
-        
-        cv::Mat frame;
-        if (data.use_dma && data.frame_va && data.frame_width > 0 && data.frame_height > 0) {
-            frame = cv::Mat(data.frame_height, data.frame_width, CV_8UC3, data.frame_va, data.frame_stride > 0 ? data.frame_stride : data.frame_width * 3);
-        } else {
-            frame = data.frame.clone();
+            queue_cv_.wait(lock, [this] {
+                return !streaming_queue_.empty() || should_stop_.load();
+            });
+            if (should_stop_.load())
+                break;
+            data = std::move(streaming_queue_.front());
+            streaming_queue_.pop();
         }
 
-        last_frame = frame.clone();
-        has_last_frame = true;
+        const auto queue_delay =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now() - data.timestamp).count();
+        static auto last_delay_warning = std::chrono::steady_clock::time_point{};
+        const auto now_steady = std::chrono::steady_clock::now();
+        if (queue_delay > 250 &&
+            now_steady - last_delay_warning > std::chrono::seconds(1)) {
+            std::cerr << "Streaming queue delay: " << queue_delay
+                      << " ms" << std::endl;
+            last_delay_warning = now_steady;
+        }
+        
+        if (!data.dma_frame || !data.dma_frame->syncForCpu())
+            continue;
+        cv::Mat frame = data.dma_frame->bgrView();
 
         if (config_.draw_detections) {
             drawDetections(frame, data);
         }
         
         if (frame.cols != config_.width || frame.rows != config_.height) {
-            cv::resize(frame, frame, cv::Size(config_.width, config_.height));
+            std::cerr << "Composite DMA frame size mismatch: "
+                      << frame.cols << "x" << frame.rows << " vs "
+                      << config_.width << "x" << config_.height << std::endl;
+            continue;
         }
         
         bool success = false;
         if (config_.enable_rtmp) {
-            success |= sendRTMPFrame(frame);
+            success |= sendRTMPFrame(data.dma_frame);
         }
         if (config_.enable_rtsp) {
+            data.dma_frame->syncForCpu();
             success |= sendRTSPFrame(frame);
         }
         
@@ -344,6 +334,8 @@ bool StreamingManager::initializeRTMP() {
         std::cerr << "Could not create output context" << std::endl;
         return false;
     }
+    fmt_ctx->flags |= AVFMT_FLAG_FLUSH_PACKETS;
+    fmt_ctx->max_delay = 0;
 
     // 创建视频流（不再让 FFmpeg 编码，只做封装）
     AVStream* stream = avformat_new_stream(fmt_ctx, nullptr);
@@ -372,6 +364,8 @@ bool StreamingManager::initializeRTMP() {
         avformat_free_context(fmt_ctx);
         return false;
     }
+    encoded_buffer_.resize(
+        static_cast<size_t>(config_.width) * config_.height * 2);
 
     // 从 MPP 获取 SPS/PPS 等 extra info，填充到 codecpar->extradata
     uint8_t header_buf[1024];
@@ -411,7 +405,8 @@ bool StreamingManager::initializeRTMP() {
     return true;
 }
 
-bool StreamingManager::sendRTMPFrame(const cv::Mat& frame) {
+bool StreamingManager::sendRTMPFrame(
+    const std::shared_ptr<DmaImageBuffer> &frame) {
     if (!avformat_context_ || !mpp_encoder_) {
         return false;
     }
@@ -422,23 +417,14 @@ bool StreamingManager::sendRTMPFrame(const cv::Mat& frame) {
     }
     AVStream* stream = fmt_ctx->streams[0];
 
-    // 使用 MPP 编码当前帧（BGR -> H.264）
-    // 预估一个足够大的缓冲区（经验值：分辨率 * 2 一般足够）
-    int max_packet_size = config_.width * config_.height * 2;
-    std::vector<uint8_t> enc_buf(max_packet_size);
-    int packet_size = max_packet_size;
-    if (!frame.isContinuous()) {
-        std::cerr << "Frame is not continuous, skip\n";
+    // 压缩码流缓冲可复用；原始 BGR/NV12 图像始终通过 DMA-BUF fd 传递。
+    if (!frame || encoded_buffer_.empty()) {
         return false;
     }
+    int packet_size = static_cast<int>(encoded_buffer_.size());
 
     int ret = mpp_encoder_->EncodeFrame(
-        frame.data,
-        frame.cols,
-        frame.rows,
-        enc_buf.data(),
-        &packet_size,
-        (int)frame.step
+        frame, encoded_buffer_.data(), &packet_size
     );
 
     if (ret != 0 || packet_size <= 0) {
@@ -448,13 +434,12 @@ bool StreamingManager::sendRTMPFrame(const cv::Mat& frame) {
 
     // 构造 AVPacket 并发送
     AVPacket pkt = {};
-    av_init_packet(&pkt);
-    pkt.data = enc_buf.data();
+    pkt.data = encoded_buffer_.data();
     pkt.size = packet_size;
     pkt.stream_index = stream->index;
     pkt.duration = 1;
     pkt.pos = -1;
-    if (isH264IdrFrame(enc_buf.data(), packet_size))
+    if (isH264IdrFrame(encoded_buffer_.data(), packet_size))
         pkt.flags |= AV_PKT_FLAG_KEY;
 
     // 简单的基于帧序号的 PTS
@@ -472,6 +457,8 @@ bool StreamingManager::sendRTMPFrame(const cv::Mat& frame) {
         std::cerr << "Error writing MPP-encoded frame to RTMP: " << errbuf << std::endl;
         return false;
     }
+    if (fmt_ctx->pb)
+        avio_flush(fmt_ctx->pb);
 
     static int send_count = 0;
     if (++send_count % 100 == 0) {

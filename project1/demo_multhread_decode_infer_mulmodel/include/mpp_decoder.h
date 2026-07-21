@@ -7,6 +7,7 @@
  */
 
 #pragma once
+#include <cstddef>
 #include <cstring>
 #include "mpp_frame.h"
 #include "rk_mpi.h"
@@ -14,7 +15,10 @@
 #include <mutex>
 #define FRAME_SYNC_TIME 0
 
-using MppDecoderFrameCallback = std::function<void(void *userdata, int width_stride, int height_stride, int width, int height, int format, int fd, void *data, int id)>;
+using MppDecoderFrameCallback = std::function<void(
+    void *userdata, int width_stride, int height_stride,
+    int width, int height, int format, int fd, void *data,
+    size_t buffer_size, int id)>;
 
 typedef struct
 {

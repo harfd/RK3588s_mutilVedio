@@ -20,6 +20,7 @@ struct StreamSourceConfig {
     int height = 0;
     int fps = 25;
     std::string chroma_order = "uv";
+    bool auto_white_balance = false;
     bool loop = true;
     int reconnect_interval_ms = 10000;
 };

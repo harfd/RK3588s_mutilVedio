@@ -10,6 +10,8 @@
 #define MPP_ENCODER_H
 
 #include <stdint.h>
+#include <memory>
+#include "dma_image.hpp"
 #include "rk_mpi.h"
 #include "rk_venc_cfg.h"
 
@@ -27,15 +29,9 @@ public:
     // codec_type:   264(H.264) / 265(H.265)
     int Init(int width, int height, int fps, int bitrate, int codec_type = 264);
 
-    // 直接编码一帧 YUV420P 数据
-    int Encode(uint8_t* yuv_data, int yuv_size, uint8_t* packet_data, int* packet_size);
-
-    // 编码一帧 BGR 图像（使用 RGA 做 BGR->YUV420P，失败时回退 OpenCV）
-    // bgr_stride: 可选，BGR 行字节步长；0 表示 width*3
-    int EncodeFrame(uint8_t* bgr_data, int width, int height, uint8_t* packet_data, int* packet_size, int bgr_stride = 0);
-
-    // 编码一帧 DMA/虚拟地址上的 BGR 图像，尽量减少拷贝
-    int EncodeFrameDma(void* bgr_va, int width, int height, uint8_t* packet_data, int* packet_size, int bgr_stride = 0);
+    // RGA 从 BGR DMA-BUF 转 NV12 DMA-BUF，MPP 直接导入同一 fd 编码。
+    int EncodeFrame(const std::shared_ptr<DmaImageBuffer> &bgr_frame,
+                    uint8_t *packet_data, int *packet_size);
 
     // 获取 SPS / PPS 等头信息（可用于 FFmpeg extradata）
     int GetHeader(uint8_t* header_data, int* header_size);
@@ -47,10 +43,8 @@ private:
     MppCtx          mpp_ctx_;
     MppApi*         mpp_mpi_;
     MppEncCfg       enc_cfg_;
-    MppFrame        frame_;
-    MppPacket       packet_;
-    MppBufferGroup  frm_grp_;
-    MppBufferGroup  pkt_grp_;
+    MppBuffer       input_buffer_;
+    std::shared_ptr<DmaImageBuffer> input_nv12_;
 
     int             width_;
     int             height_;
@@ -59,9 +53,7 @@ private:
     MppCodingType   mpp_type_;
     bool            initialized_;
 
-    // 预分配的 YUV 缓冲区，避免每帧 malloc/free
-    uint8_t*        yuv_buffer_;
-    int             yuv_buffer_size_;
+    int EncodeNv12(uint8_t *packet_data, int *packet_size);
 };
 
 #endif // MPP_ENCODER_H

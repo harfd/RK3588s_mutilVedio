@@ -297,6 +297,8 @@ bool AppConfigLoader::load(const std::string& file_path, AppConfig& config,
             !get_int(data, section, "width", 0, source.width, error) ||
             !get_int(data, section, "height", 0, source.height, error) ||
             !get_int(data, section, "fps", 25, source.fps, error) ||
+            !get_bool(data, section, "auto_white_balance", false,
+                      source.auto_white_balance, error) ||
             !get_bool(data, section, "loop", true, source.loop, error) ||
             !get_int(data, section, "reconnect_interval_ms", 10000,
                      source.reconnect_interval_ms, error)) {
