@@ -56,9 +56,6 @@ private:
     rknn_tensor_mem *input_mem_ = nullptr;
     int model_id_ = -1;   // 基准埋点标签(模型角色: 0=person/1=helmet/3=callplay)
     int input_stride_ = 0;
-#ifdef TRANSFER_MODE_COPY
-    std::vector<uint8_t> input_rgb_;  // 深拷贝: 堆上 RGB 输入, 每帧经 rknn_inputs_set 拷入
-#endif
 
 public:
     Mat ori_img;
@@ -178,8 +175,7 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
     const size_t input_size = std::max(
         minimum_input_size,
         static_cast<size_t>(input_attrs[0].size_with_stride));
-#ifndef TRANSFER_MODE_COPY
-    // DMA 零拷贝: RGA 直接写入外部 DMA-BUF, RKNN 通过 fd 读取, 运行时不复制输入。
+    // 两种模式都用 DMA-BUF 作 RGA 预处理输出(RGA 只能用 handle/fd, 不能虚地址访问 dma_buf)。
     input_dma_ = DmaImageBuffer::create(
         width, height, input_stride, height,
         RK_FORMAT_RGB_888, input_size);
@@ -188,6 +184,8 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
         fprintf(stderr, "Failed to allocate RKNN input DMA-BUF\n");
         exit(-1);
     }
+#ifndef TRANSFER_MODE_COPY
+    // DMA 零拷贝: RKNN 通过 fd 直接读取输入 DMA-BUF, 运行时不复制输入。
     input_mem_ = rknn_create_mem_from_fd(
         rkModel, input_dma_->fd(), input_dma_->data(),
         static_cast<uint32_t>(input_dma_->size()), 0);
@@ -205,9 +203,8 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
     printf("RKNN model id=%d input DMA-BUF fd=%d, tensor=%dx%dx%d, stride=%d\n",
            id, input_dma_->fd(), width, height, channel, input_stride);
 #else
-    // 深拷贝: RGA 写入堆缓冲, 每帧经 rknn_inputs_set 复制进 RKNN 内部输入。
-    input_rgb_.resize(input_size);
-    printf("RKNN model id=%d input HEAP copy, tensor=%dx%dx%d, stride=%d\n",
+    // 深拷贝: 不绑定 fd; 每帧 rknn_inputs_set 把 RGB 输入复制进 RKNN 内部输入。
+    printf("RKNN model id=%d input HEAP copy (rknn_inputs_set), tensor=%dx%dx%d, stride=%d\n",
            id, width, height, channel, input_stride);
 #endif
 }
@@ -237,18 +234,12 @@ void rknn_lite::setInputFrame(
 
 int rknn_lite::interf(detect_result_group_t &detect_result_group)
 {
-#ifndef TRANSFER_MODE_COPY
     if (!source_dma_ || !input_dma_ ||
         !source_dma_->syncForDevice() || !input_dma_->syncForDevice())
         return -1;
-#else
-    if (!source_dma_ || !source_dma_->syncForDevice())
-        return -1;
-#endif
 
     const int img_width = source_dma_->width();
     const int img_height = source_dma_->height();
-#ifndef TRANSFER_MODE_COPY
     rga_buffer_t source = wrapbuffer_handle_t(
         source_dma_->rgaHandle(), img_width, img_height,
         source_dma_->widthStride(), source_dma_->heightStride(),
@@ -257,16 +248,6 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
         input_dma_->rgaHandle(), width, height,
         input_dma_->widthStride(), input_dma_->heightStride(),
         RK_FORMAT_RGB_888);
-#else
-    // 深拷贝: RGA 通过虚拟地址访问(无 fd 零拷贝), 目标为堆缓冲。
-    rga_buffer_t source = wrapbuffer_virtualaddr_t(
-        source_dma_->data(), img_width, img_height,
-        source_dma_->widthStride(), source_dma_->heightStride(),
-        RK_FORMAT_BGR_888);
-    rga_buffer_t destination = wrapbuffer_virtualaddr_t(
-        input_rgb_.data(), width, height,
-        input_stride_, height, RK_FORMAT_RGB_888);
-#endif
     const rga_buffer_t empty_buffer = {};
     const im_rect source_rect = {0, 0, img_width, img_height};
     const im_rect destination_rect = {0, 0, width, height};
@@ -293,20 +274,24 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
     }
 
 #ifdef TRANSFER_MODE_COPY
-    // 深拷贝: 每帧把堆上的 RGB 输入复制进 RKNN 内部输入张量。
+    // 深拷贝: 让 CPU 可见 RGA 写入的 RGB, 再逐帧 rknn_inputs_set 复制进 RKNN 内部输入
+    // (对照 DMA 模式的 fd 绑定零拷贝)。这一份逐帧输入拷贝就是 T3 的核心差异。
+    if (!input_dma_->syncForCpu())
+        return -1;
     {
         BENCH_SCOPE("rknn_set", model_id_);
         rknn_input inputs[1];
         memset(inputs, 0, sizeof(inputs));
         inputs[0].index = 0;
         inputs[0].type = RKNN_TENSOR_UINT8;
-        inputs[0].size = static_cast<uint32_t>(input_rgb_.size());
+        inputs[0].size = static_cast<uint32_t>(input_dma_->size());
         inputs[0].fmt = RKNN_TENSOR_NHWC;
         inputs[0].pass_through = 0;
-        inputs[0].buf = input_rgb_.data();
+        inputs[0].buf = input_dma_->data();
         ret = rknn_inputs_set(rkModel, 1, inputs);
-        BENCH_ADD_COPY(input_rgb_.size());
+        BENCH_ADD_COPY(input_dma_->size());
     }
+    input_dma_->syncForDevice();
     if (ret < 0)
     {
         fprintf(stderr, "rknn_inputs_set failed ret=%d\n", ret);
