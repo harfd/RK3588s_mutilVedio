@@ -13,7 +13,9 @@
 set -euo pipefail
 
 # ======================= 可配置区 =======================
-PROJECT_DIR="${PROJECT_DIR:-$HOME/multi_video/RK3588s_mutilVedio/project1/demo_multhread_decode_infer_mulmodel}"
+# 从脚本自身位置推导项目目录(bench 的上一级), 避免 sudo 下 $HOME=/root 及目录名差异问题。
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$(dirname "$SCRIPT_DIR")}"
 # 结果落在 bench/results 下 (已 gitignore)。如需减少板端 eMMC 写入可改指向 tmpfs。
 RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_DIR/bench/results}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
