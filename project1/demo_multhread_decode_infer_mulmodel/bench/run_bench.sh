@@ -14,7 +14,8 @@ set -euo pipefail
 
 # ======================= 可配置区 =======================
 PROJECT_DIR="${PROJECT_DIR:-$HOME/multi_video/RK3588s_mutilVedio/project1/demo_multhread_decode_infer_mulmodel}"
-RESULTS_ROOT="${RESULTS_ROOT:-/tmp/dma_bench}"          # tmpfs, 不入仓库
+# 结果落在 bench/results 下 (已 gitignore)。如需减少板端 eMMC 写入可改指向 tmpfs。
+RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_DIR/bench/results}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="$RESULTS_ROOT/run_$RUN_TAG"
 
