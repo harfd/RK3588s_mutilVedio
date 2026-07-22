@@ -121,8 +121,13 @@ int MppEncoder::Init(int width, int height, int fps, int bitrate, int codec_type
 
     input_info.type = MPP_BUFFER_TYPE_EXT_DMA;
     input_info.size = input_nv12_->size();
-    input_info.ptr = input_nv12_->data();
+    // EXT_DMA 只通过 DMA-BUF fd 导入，不能同时传入用户态虚拟地址。
+    input_info.ptr = NULL;
+    input_info.hnd = NULL;
     input_info.fd = input_nv12_->fd();
+    input_info.index = 0;
+    fprintf(stdout, "Importing encoder DMA-BUF into MPP: fd=%d, size=%zu\n",
+            input_info.fd, input_info.size);
     ret = mpp_buffer_import(&input_buffer_, &input_info);
     if (ret != MPP_OK || !input_buffer_) {
         fprintf(stderr, "failed to import encoder DMA-BUF into MPP ret %d\n", ret);
