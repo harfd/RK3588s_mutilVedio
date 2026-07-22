@@ -85,11 +85,12 @@ void mpp_decoder_frame_callback(void *buffer, int width_stride,
         return;
     }
 
-    // T1: 解码 NV12 -> BGR 转换 (含 RGA import + 发布)
-    BENCH_SCOPE("decode_cvt", id);
+    // T1: 解码 NV12 -> BGR 转换。decode_cvt 只覆盖转换本身(不含克隆/限速睡眠)。
+    bool converted = false;
+    {
+        BENCH_SCOPE("decode_cvt", id);
 
     // 正常路径：MPP DMA-BUF fd -> RGA -> BGR DMA-BUF，不复制原始图像。
-    bool converted = false;
     if (fd >= 0 && buffer_size > 0)
     {
         const uint32_t source_handle = importbuffer_fd(
@@ -147,12 +148,16 @@ void mpp_decoder_frame_callback(void *buffer, int width_stride,
         cv::Mat yuv_mat(height + height / 2, width, CV_8UC1, yuv_data);
         cv::cvtColor(yuv_mat, output_frame->bgrView(), opencv_conversion);
     }
+    } // decode_cvt 结束(仅转换)
 #ifdef TRANSFER_MODE_COPY
-    // T1 深拷贝: 解码输出交给推理线程前克隆一份整帧(对照 DMA 的 shared_ptr 零拷贝交接)。
-    if (output_frame->syncForCpu())
+    // T1 深拷贝: 解码输出交推理线程前克隆整帧, 单独计入 clone_t1。
     {
-        copy_clone(output_frame->data(), output_frame->size());
-        output_frame->syncForDevice();
+        BENCH_SCOPE("clone_t1", id);
+        if (output_frame->syncForCpu())
+        {
+            copy_clone(output_frame->data(), output_frame->size());
+            output_frame->syncForDevice();
+        }
     }
 #endif
     bool first_dma_frame = false;

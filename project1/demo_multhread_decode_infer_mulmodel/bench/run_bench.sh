@@ -180,47 +180,110 @@ build_all() {
 analyze() {
   local dir="${1:-$RUN_DIR}"
   local summary="$dir/summary.csv"
-  echo "variant,workload,cpu_pct_mean,cpu_pct_std,rss_mb_mean,rss_mb_peak,pss_mb_mean,temp_c_peak" > "$summary"
-  for variant in "${VARIANTS[@]}"; do
-    for workload in "${WORKLOADS[@]}"; do
-      # 跨 rep 汇总稳态窗口(跳过前 WARMUP 行)的 sys_sample.csv
-      awk -v V="$variant" -v W="$workload" -v warm="$WARMUP_S" '
-        FNR==1 { next }                                  # 跳表头
-        FNR<=warm+1 { next }                             # 跳预热
-        { n++; rss+=$2; rss2+=$2*$2; if($2>rssp)rssp=$2;
-          pss+=$3; if($5>tp)tp=$5 }
-        END{}
-      ' "$dir"/${variant}_${workload}_r*/sys_sample.csv 2>/dev/null \
-        | : # (占位, 内存统计在下方 python 更稳)
-      # CPU 用 pidstat 的 %CPU 列, 跨 rep 求均值/方差
-      python3 - "$dir" "$variant" "$workload" "$WARMUP_S" >> "$summary" <<'PY' || true
-import sys,glob,statistics as st
-d,variant,workload,warm=sys.argv[1],sys.argv[2],sys.argv[3],int(sys.argv[4])
-cpu=[]; rss=[]; pss=[]; tp=0
-for f in glob.glob(f"{d}/{variant}_{workload}_r*/sys_sample.csv"):
-    rows=open(f).read().splitlines()[1+warm:]
+  python3 - "$dir" "$WARMUP_S" "$WINDOW_S" "$summary" <<'PY' || true
+import sys, glob, os, re, statistics as st, collections
+d, warm, window, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+
+def pidstat(path):
+    # pidstat -h: $1时间 $2UID $3PID $4%usr $5%system $6%guest $7%wait $8%CPU
+    u=[]; s=[]; c=[]; n=0
+    try: f=open(path, encoding="utf-8", errors="replace")
+    except OSError: return u,s,c
+    for line in f:
+        line=line.strip()
+        if not line or line[0]=='#' or line.startswith("Linux"): continue
+        p=line.split()
+        if len(p)<8: continue
+        try: uu=float(p[3]); ss=float(p[4]); cc=float(p[7])
+        except ValueError: continue
+        n+=1
+        if n<=warm: continue           # 跳预热(约 1 行/秒)
+        u.append(uu); s.append(ss); c.append(cc)
+    return u,s,c
+
+def sysmem(path):
+    rss=[]; pss=[]; tp=0.0
+    try: rows=open(path,encoding="utf-8",errors="replace").read().splitlines()[1:]
+    except OSError: return rss,pss,tp
+    for i,r in enumerate(rows):
+        cc=r.split(",")
+        if len(cc)<5 or not cc[1]: continue
+        if i<warm: continue
+        try:
+            rss.append(float(cc[1])/1024)
+            if cc[2]: pss.append(float(cc[2])/1024)
+            tp=max(tp,float(cc[4]))
+        except ValueError: pass
+    return rss,pss,tp
+
+def copied(path):
+    try:
+        for line in open(path,encoding="utf-8",errors="replace"):
+            if "copied_bytes=" in line:
+                return int(line.split("copied_bytes=")[1].split()[0])
+    except OSError: pass
+    return 0
+
+def stages(rundir):
+    durs=collections.defaultdict(list); warm_us=warm*1_000_000
+    for f in glob.glob(os.path.join(rundir,"stage_tid*.csv")):
+        for line in open(f,encoding="utf-8",errors="replace"):
+            cc=line.split(",")
+            if len(cc)!=4 or cc[0]=="t_start_us": continue
+            try: t0=int(cc[0]); dd=int(cc[1]); sg=cc[3].strip()
+            except ValueError: continue
+            if t0<warm_us: continue
+            durs[sg].append(dd)
+    return durs
+
+runs=collections.defaultdict(list)
+for rd in sorted(glob.glob(os.path.join(d,"*_r*"))):
+    if not os.path.isdir(rd): continue
+    m=re.match(r'(.+)_(capped|uncapped)_r\d+$', os.path.basename(rd))
+    if m: runs[(m.group(1),m.group(2))].append(rd)
+
+STAGES=["decode_cvt","rknn_pre","rknn_set","rknn_run","composite","enc_cvt","encode",
+        "clone_t1","clone_t5","clone_t6"]
+mean=lambda x: st.mean(x) if x else 0.0
+pstd=lambda x: st.pstdev(x) if len(x)>1 else 0.0
+
+rows=[]
+for key in sorted(runs):
+    v,w=key
+    cpu=[];usr=[];sysc=[];rssL=[];pssL=[];rpk=[];cpd=[];fps=[]
+    stg=collections.defaultdict(list)
+    for rd in runs[key]:
+        u,s,c=pidstat(os.path.join(rd,"pidstat.log"))
+        if c: cpu.append(mean(c)); usr.append(mean(u)); sysc.append(mean(s))
+        rss,pss,tp=sysmem(os.path.join(rd,"sys_sample.csv"))
+        if rss: rssL.append(mean(rss)); pssL.append(mean(pss)); rpk.append(max(rss))
+        cpd.append(copied(os.path.join(rd,"app_stdout.log")))
+        du=stages(rd); fps.append(len(du.get("composite",[]))/window)
+        for sg,xs in du.items():
+            if xs: stg[sg].append(mean(xs))
+    r={"variant":v,"workload":w,"cpu":mean(cpu),"cpu_sd":pstd(cpu),"usr":mean(usr),
+       "sys":mean(sysc),"rss":mean(rssL),"pss":mean(pssL),"rss_pk":mean(rpk),
+       "copied_gb":mean([x/1e9 for x in cpd]),"fps":mean(fps)}
+    for sg in STAGES: r[sg]=mean(stg[sg]) if sg in stg else 0.0
+    rows.append(r)
+
+cols=["variant","workload","cpu","cpu_sd","usr","sys","rss","pss","rss_pk","copied_gb","fps"]+STAGES
+with open(out,"w",encoding="utf-8") as f:
+    f.write(",".join(cols)+"\n")
     for r in rows:
-        c=r.split(',')
-        try:
-            rss.append(float(c[1])/1024);
-            if c[2]: pss.append(float(c[2])/1024)
-            tp=max(tp,float(c[4]))
-        except: pass
-for f in glob.glob(f"{d}/{variant}_{workload}_r*/pidstat.log"):
-    for r in open(f):
-        p=r.split()
-        # pidstat -h -u: 末列附近为 %CPU; 取倒数第2列并容错
-        try:
-            val=float(p[-2]);  cpu.append(val)
-        except: pass
-def ms(x): return (st.mean(x), (st.pstdev(x) if len(x)>1 else 0.0)) if x else (0,0)
-cm,csd=ms(cpu); rm,_=ms(rss); pm,_=ms(pss)
-rp=max(rss) if rss else 0
-print(f"{variant},{workload},{cm:.1f},{csd:.1f},{rm:.1f},{rp:.1f},{pm:.1f},{tp:.0f}")
+        f.write(",".join(f"{r[c]:.2f}" if isinstance(r[c],float) else str(r[c]) for c in cols)+"\n")
+
+print(f"{'variant/workload':<18}{'CPU%':>8}{'usr%':>7}{'sys%':>7}{'RSS':>8}{'PSS':>8}{'copGB':>8}{'fps':>8}")
+for r in rows:
+    print(f"{r['variant']+'/'+r['workload']:<18}{r['cpu']:>8.1f}{r['usr']:>7.1f}{r['sys']:>7.1f}"
+          f"{r['rss']:>8.0f}{r['pss']:>8.0f}{r['copied_gb']:>8.1f}{r['fps']:>8.1f}")
+print()
+print(f"{'variant/workload':<18}"+"".join(f"{s[:9]:>10}" for s in STAGES)+"   (us)")
+for r in rows:
+    print(f"{r['variant']+'/'+r['workload']:<18}"+"".join(f"{r[s]:>10.0f}" for s in STAGES))
+print(f"\nsummary.csv -> {out}")
 PY
-    done
-  done
-  log "汇总 -> $summary"; echo; cat "$summary"
+  log "汇总 -> $summary"
 }
 
 # ======================= 主流程 =======================

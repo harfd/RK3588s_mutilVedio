@@ -182,8 +182,6 @@ int MppEncoder::EncodeFrame(
         return -1;
     }
 
-    BENCH_SCOPE("encode", -1);   // T6: RGA BGR->NV12 + MPP H.264 编码
-
     rga_buffer_t source = wrapbuffer_handle_t(
         bgr_frame->rgaHandle(), bgr_frame->width(), bgr_frame->height(),
         bgr_frame->widthStride(), bgr_frame->heightStride(),
@@ -192,9 +190,13 @@ int MppEncoder::EncodeFrame(
         input_nv12_->rgaHandle(), width_, height_,
         input_nv12_->widthStride(), input_nv12_->heightStride(),
         RK_FORMAT_YCbCr_420_SP);
-    const IM_STATUS status = imcvtcolor(
-        source, destination, RK_FORMAT_BGR_888,
-        RK_FORMAT_YCbCr_420_SP, IM_RGB_TO_YUV_BT601_LIMIT);
+    IM_STATUS status;
+    {
+        BENCH_SCOPE("enc_cvt", -1);   // T6: RGA BGR->NV12
+        status = imcvtcolor(
+            source, destination, RK_FORMAT_BGR_888,
+            RK_FORMAT_YCbCr_420_SP, IM_RGB_TO_YUV_BT601_LIMIT);
+    }
     if (status != IM_STATUS_SUCCESS) {
         fprintf(stderr, "RGA DMA BGR->NV12 conversion failed (%d: %s)\n",
                 static_cast<int>(status), imStrError_t(status));
@@ -202,11 +204,14 @@ int MppEncoder::EncodeFrame(
     }
 
 #ifdef TRANSFER_MODE_COPY
-    // T6 深拷贝: 复现非零拷贝编码器把 NV12 逐帧 memcpy 进 MPP 输入缓冲的开销
-    // (对照当前 EXT_DMA 导入 fd 的零拷贝)。
-    if (input_nv12_->syncForCpu()) {
-        copy_clone(input_nv12_->data(), input_nv12_->size());
-        input_nv12_->syncForDevice();
+    // T6 深拷贝: 复现非零拷贝编码器把 NV12 逐帧 memcpy 进 MPP 输入缓冲的开销,
+    // 单独计入 clone_t6 (对照 EXT_DMA 导入 fd 的零拷贝)。
+    {
+        BENCH_SCOPE("clone_t6", -1);
+        if (input_nv12_->syncForCpu()) {
+            copy_clone(input_nv12_->data(), input_nv12_->size());
+            input_nv12_->syncForDevice();
+        }
     }
 #endif
 
@@ -218,6 +223,8 @@ int MppEncoder::EncodeNv12(uint8_t *packet_data, int *packet_size) {
         fprintf(stderr, "Encoder not initialized\n");
         return -1;
     }
+
+    BENCH_SCOPE("encode", -1);   // T6: MPP H.264 编码(提交帧 + 取码流)
 
     MPP_RET ret = MPP_OK;
     MppFrame frame = NULL;

@@ -288,11 +288,14 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
         if (streaming_enabled)
         {
 #ifdef TRANSFER_MODE_COPY
-            // T5 深拷贝: 合成帧交给推流线程前克隆一份整帧。
-            if (combined_frame->syncForCpu())
+            // T5 深拷贝: 合成帧交推流线程前克隆整帧, 单独计入 clone_t5。
             {
-                copy_clone(combined_frame->data(), combined_frame->size());
-                combined_frame->syncForDevice();
+                BENCH_SCOPE("clone_t5", -1);
+                if (combined_frame->syncForCpu())
+                {
+                    copy_clone(combined_frame->data(), combined_frame->size());
+                    combined_frame->syncForDevice();
+                }
             }
 #endif
             StreamingData stream_data;
