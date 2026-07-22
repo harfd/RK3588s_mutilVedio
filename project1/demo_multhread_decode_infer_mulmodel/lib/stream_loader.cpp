@@ -147,6 +147,14 @@ void mpp_decoder_frame_callback(void *buffer, int width_stride,
         cv::Mat yuv_mat(height + height / 2, width, CV_8UC1, yuv_data);
         cv::cvtColor(yuv_mat, output_frame->bgrView(), opencv_conversion);
     }
+#ifdef TRANSFER_MODE_COPY
+    // T1 深拷贝: 解码输出交给推理线程前克隆一份整帧(对照 DMA 的 shared_ptr 零拷贝交接)。
+    if (output_frame->syncForCpu())
+    {
+        copy_clone(output_frame->data(), output_frame->size());
+        output_frame->syncForDevice();
+    }
+#endif
     bool first_dma_frame = false;
     {
         std::lock_guard<std::mutex> lock(mbuffer->mtx);

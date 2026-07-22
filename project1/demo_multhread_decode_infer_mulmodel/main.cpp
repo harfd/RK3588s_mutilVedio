@@ -287,6 +287,14 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
 
         if (streaming_enabled)
         {
+#ifdef TRANSFER_MODE_COPY
+            // T5 深拷贝: 合成帧交给推流线程前克隆一份整帧。
+            if (combined_frame->syncForCpu())
+            {
+                copy_clone(combined_frame->data(), combined_frame->size());
+                combined_frame->syncForDevice();
+            }
+#endif
             StreamingData stream_data;
             stream_data.stream_id = 0;
             stream_data.dma_frame = combined_frame;

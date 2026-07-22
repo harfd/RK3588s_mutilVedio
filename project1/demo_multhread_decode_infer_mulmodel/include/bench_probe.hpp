@@ -63,3 +63,18 @@ static inline void bench_flush() {}
 #define BENCH_ADD_COPY(bytes) ((void)0)
 
 #endif // BENCH
+
+#ifdef TRANSFER_MODE_COPY
+#include <vector>
+#include <cstring>
+// 深拷贝交接模型: 把 n 字节整帧复制到线程本地堆暂存, 复现非零拷贝交接的
+// CPU/DDR 拷贝开销 (与深拷贝管线每级克隆一份整帧等价), 并计入 g_copied_bytes。
+inline void copy_clone(const void *src, size_t n)
+{
+    static thread_local std::vector<uint8_t> staging;
+    if (staging.size() < n)
+        staging.resize(n);
+    std::memcpy(staging.data(), src, n);
+    BENCH_ADD_COPY(n);
+}
+#endif

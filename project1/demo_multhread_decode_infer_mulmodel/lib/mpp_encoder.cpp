@@ -201,6 +201,15 @@ int MppEncoder::EncodeFrame(
         return -1;
     }
 
+#ifdef TRANSFER_MODE_COPY
+    // T6 深拷贝: 复现非零拷贝编码器把 NV12 逐帧 memcpy 进 MPP 输入缓冲的开销
+    // (对照当前 EXT_DMA 导入 fd 的零拷贝)。
+    if (input_nv12_->syncForCpu()) {
+        copy_clone(input_nv12_->data(), input_nv12_->size());
+        input_nv12_->syncForDevice();
+    }
+#endif
+
     return EncodeNv12(packet_data, packet_size);
 }
 
