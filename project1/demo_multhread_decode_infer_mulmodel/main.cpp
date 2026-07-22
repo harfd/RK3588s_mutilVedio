@@ -160,6 +160,7 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
 
     std::vector<std::shared_ptr<DmaImageBuffer>> latest_frames(
         stream_manager.num_stream);
+    std::vector<int> initialized_composite_fds;
     const int frame_interval_ms = 1000 / std::max(target_fps, 1);
 
     auto last_frame_time = std::chrono::steady_clock::now();
@@ -189,18 +190,33 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
             continue;
         }
 
+        // 部分板端 RGA 驱动不支持对 BGR888 DMA-BUF 执行 color fill。
+        // 每个池缓冲区只在首次使用时清零，后续画面继续由 RGA 原地覆盖。
+        if (std::find(initialized_composite_fds.begin(),
+                      initialized_composite_fds.end(),
+                      combined_frame->fd()) == initialized_composite_fds.end())
+        {
+            if (!combined_frame->syncForCpu())
+            {
+                std::cerr << "Failed to begin CPU access for composite DMA-BUF"
+                          << std::endl;
+                continue;
+            }
+            std::memset(combined_frame->data(), 0, combined_frame->size());
+            if (!combined_frame->syncForDevice())
+            {
+                std::cerr << "Failed to publish cleared composite DMA-BUF"
+                          << std::endl;
+                continue;
+            }
+            initialized_composite_fds.push_back(combined_frame->fd());
+        }
+
         rga_buffer_t combined_buffer = wrapbuffer_handle_t(
             combined_frame->rgaHandle(),
             kCompositeWidth, kCompositeHeight,
             combined_frame->widthStride(), combined_frame->heightStride(),
             RK_FORMAT_BGR_888);
-        const im_rect full_rect = {
-            0, 0, kCompositeWidth, kCompositeHeight};
-        if (imfill(combined_buffer, full_rect, 0) != IM_STATUS_SUCCESS)
-        {
-            std::cerr << "RGA failed to clear composite frame" << std::endl;
-            continue;
-        }
 
         bool has_frame = false;
         for (int i = 0; i < stream_manager.num_stream; ++i)
