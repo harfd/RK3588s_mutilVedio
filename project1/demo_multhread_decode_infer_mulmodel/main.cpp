@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "app_config.h"
+#include "bench_probe.hpp"
 #include "detection_fusion_manager.h"
 #include "dma_image.hpp"
 #include "realtime_logger.h"
@@ -166,12 +167,17 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
     auto last_frame_time = std::chrono::steady_clock::now();
     while (true)
     {
+        // 基准测试到点优雅退出, 让 reader_thread.join() 返回并触发清理/flush。
+        if (bench_should_stop())
+            break;
+
         auto current_time = std::chrono::steady_clock::now();
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 current_time - last_frame_time)
                 .count();
-        if (elapsed < frame_interval_ms)
+        // BENCH_UNCAPPED 工况下不限速, 测吞吐天花板。
+        if (!bench_uncapped() && elapsed < frame_interval_ms)
         {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(frame_interval_ms - elapsed));
@@ -219,6 +225,8 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
             RK_FORMAT_BGR_888);
 
         bool has_frame = false;
+        {
+        BENCH_SCOPE("composite", -1);
         for (int i = 0; i < stream_manager.num_stream; ++i)
         {
             {
@@ -256,6 +264,7 @@ void combineImage(StreamLoaderManager& stream_manager, int target_fps,
             }
             has_frame = true;
         }
+        } // BENCH_SCOPE("composite")
 
         if (!has_frame)
             continue;
@@ -420,6 +429,8 @@ void rknn_infer(rknn_lite* person, rknn_lite* helmet, rknn_lite* tired,
 
 int main(int argc, char* argv[])
 {
+    bench_init();
+
     RealtimeLogger realtime_logger;
     if (!realtime_logger.start())
         std::cerr << "Realtime file logging is unavailable; continuing with console output"
@@ -571,5 +582,6 @@ int main(int argc, char* argv[])
         }
     }
     rk_pool.clear();
+    bench_flush();
     return 0;
 }

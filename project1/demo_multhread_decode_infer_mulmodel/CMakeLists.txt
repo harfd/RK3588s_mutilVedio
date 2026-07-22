@@ -6,6 +6,22 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "-pthread")
 
+# ================= 基准测试开关 (仅测试分支使用) =================
+# BENCH:         启用分阶段计时/拷贝计数/自终止钩子, 关闭时零开销
+# TRANSFER_COPY: 用深拷贝路径替代 DMA-BUF fd 传递 (对照组)
+option(BENCH         "Enable benchmark probes" OFF)
+option(TRANSFER_COPY "Use deep-copy transfer instead of DMA-BUF fd" OFF)
+if(BENCH)
+    add_compile_definitions(BENCH=1)
+    message(STATUS "BENCH probes: ON")
+endif()
+if(TRANSFER_COPY)
+    add_compile_definitions(TRANSFER_MODE_COPY=1)
+    message(STATUS "Transfer mode: DEEP-COPY")
+else()
+    message(STATUS "Transfer mode: DMA-BUF (zero-copy)")
+endif()
+
 # ================= 项目根路径 =================
 set(PROJECT_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -94,6 +110,7 @@ include_directories(
 # ================= demo 源码 =================
 set(DEMO_LIB_SOURCES
     ${PROJECT_ROOT}/lib/app_config.cpp
+    ${PROJECT_ROOT}/lib/bench_probe.cpp
     ${PROJECT_ROOT}/lib/detection_fusion_manager.cpp
     ${PROJECT_ROOT}/lib/dma_image.cpp
     ${PROJECT_ROOT}/lib/mpp_decoder.cpp

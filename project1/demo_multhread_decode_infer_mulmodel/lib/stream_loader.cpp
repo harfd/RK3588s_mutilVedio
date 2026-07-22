@@ -7,6 +7,7 @@
  */
 
 #include "stream_loader.h"
+#include "bench_probe.hpp"
 #include "im2d.h"
 #include <chrono>
 #include <string>
@@ -83,6 +84,9 @@ void mpp_decoder_frame_callback(void *buffer, int width_stride,
                     dropped);
         return;
     }
+
+    // T1: 解码 NV12 -> BGR 转换 (含 RGA import + 发布)
+    BENCH_SCOPE("decode_cvt", id);
 
     // 正常路径：MPP DMA-BUF fd -> RGA -> BGR DMA-BUF，不复制原始图像。
     bool converted = false;
@@ -471,7 +475,8 @@ int StreamLoader::open()
 
     is_local_file_ = source_.type == InputSourceType::Mp4;
 
-    if (is_local_file_ && source_fps_ > 0) {
+    // BENCH_UNCAPPED 工况下关闭本地文件限速, 让解码尽可能快以测吞吐天花板。
+    if (is_local_file_ && source_fps_ > 0 && !bench_uncapped()) {
         buffer.throttle = true;
         buffer.frame_interval_ms = (int)(1000.0 / source_fps_);
     } else {

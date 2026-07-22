@@ -7,6 +7,7 @@
  */
 
 #include "mpp_encoder.h"
+#include "bench_probe.hpp"
 #include "im2d.h"
 #include <stdio.h>
 #include <string.h>
@@ -180,6 +181,8 @@ int MppEncoder::EncodeFrame(
         fprintf(stderr, "Encoder DMA-BUF is unavailable\n");
         return -1;
     }
+
+    BENCH_SCOPE("encode", -1);   // T6: RGA BGR->NV12 + MPP H.264 编码
 
     rga_buffer_t source = wrapbuffer_handle_t(
         bgr_frame->rgaHandle(), bgr_frame->width(), bgr_frame->height(),

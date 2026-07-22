@@ -1,0 +1,2 @@
+# 保证 shell 脚本以 LF 行尾入库/检出, 避免在 RK3588 Linux 板端因 CRLF 无法执行。
+*.sh text eol=lf

@@ -23,6 +23,7 @@
 #include "rknn_api.h"
 #include "postprocess.h"
 #include "dma_image.hpp"
+#include "bench_probe.hpp"
 #include "opencv2/core/core.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/imgproc.hpp"
@@ -53,6 +54,7 @@ private:
     std::shared_ptr<DmaImageBuffer> input_dma_;
     std::shared_ptr<DmaImageBuffer> source_dma_;
     rknn_tensor_mem *input_mem_ = nullptr;
+    int model_id_ = -1;   // 基准埋点标签(模型角色: 0=person/1=helmet/3=callplay)
 
 public:
     Mat ori_img;
@@ -67,6 +69,7 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
                      int id, float box_conf_threshold, float nms_threshold)
 {
     this->class_num = class_num;
+    model_id_ = id;
     box_conf_threshold_ = box_conf_threshold;
     nms_threshold_ = nms_threshold;
     /* Create the neural network */
@@ -239,9 +242,13 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
     const im_rect source_rect = {0, 0, img_width, img_height};
     const im_rect destination_rect = {0, 0, width, height};
     const im_rect empty_rect = {};
-    const IM_STATUS rga_status = improcess(
-        source, destination, empty_buffer,
-        source_rect, destination_rect, empty_rect, IM_SYNC);
+    IM_STATUS rga_status;
+    {
+        BENCH_SCOPE("rknn_pre", model_id_);   // T3: RGA BGR->RGB 预处理
+        rga_status = improcess(
+            source, destination, empty_buffer,
+            source_rect, destination_rect, empty_rect, IM_SYNC);
+    }
     if (rga_status != IM_STATUS_SUCCESS)
     {
         fprintf(stderr, "RGA RKNN input preprocessing failed (%d: %s)\n",
@@ -261,7 +268,10 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
     memset(outputs, 0, sizeof(outputs));
     for (uint32_t i = 0; i < io_num.n_output; i++)
         outputs[i].want_float = 0; // 调用npu进行推演
-    ret = rknn_run(rkModel, NULL);
+    {
+        BENCH_SCOPE("rknn_run", model_id_);   // T3: NPU 推理 (两变体应一致)
+        ret = rknn_run(rkModel, NULL);
+    }
     if (ret < 0)
     {
         fprintf(stderr, "rknn_run failed ret=%d\n", ret);

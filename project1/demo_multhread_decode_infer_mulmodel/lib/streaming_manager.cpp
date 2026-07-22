@@ -7,6 +7,7 @@
  */
 
 #include "streaming_manager.h"
+#include "bench_probe.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -324,6 +325,25 @@ std::string StreamingManager::createDetectionJSON(const StreamingData& data) {
 }
 
 bool StreamingManager::initializeRTMP() {
+    if (bench_null_sink()) {
+        // 基准测试: 只初始化 MPP 编码器, 不建立网络封装。
+        // 编码照常执行(计入 T6), 码流丢弃, 从而无需 RTMP 服务器且不引入网络噪声。
+        mpp_encoder_ = new MppEncoder();
+        if (mpp_encoder_->Init(config_.width, config_.height,
+                               config_.fps, config_.bitrate, 264) != 0) {
+            std::cerr << "Failed to init MPP encoder (null sink)" << std::endl;
+            delete mpp_encoder_;
+            mpp_encoder_ = nullptr;
+            return false;
+        }
+        encoded_buffer_.resize(
+            static_cast<size_t>(config_.width) * config_.height * 2);
+        avformat_context_ = nullptr;
+        std::cout << "[bench] RTMP null sink: encode only, no network send"
+                  << std::endl;
+        return true;
+    }
+
     // 初始化 FFmpeg 网络
     avformat_network_init();
 
@@ -407,18 +427,8 @@ bool StreamingManager::initializeRTMP() {
 
 bool StreamingManager::sendRTMPFrame(
     const std::shared_ptr<DmaImageBuffer> &frame) {
-    if (!avformat_context_ || !mpp_encoder_) {
-        return false;
-    }
-
-    AVFormatContext* fmt_ctx = (AVFormatContext*)avformat_context_;
-    if (fmt_ctx->nb_streams == 0) {
-        return false;
-    }
-    AVStream* stream = fmt_ctx->streams[0];
-
     // 压缩码流缓冲可复用；原始 BGR/NV12 图像始终通过 DMA-BUF fd 传递。
-    if (!frame || encoded_buffer_.empty()) {
+    if (!mpp_encoder_ || !frame || encoded_buffer_.empty()) {
         return false;
     }
     int packet_size = static_cast<int>(encoded_buffer_.size());
@@ -431,6 +441,21 @@ bool StreamingManager::sendRTMPFrame(
         // 本帧没有有效编码输出，直接跳过
         return false;
     }
+
+    if (bench_null_sink()) {
+        // 编码已计入 T6; 基准测试丢弃码流, 不做网络发送。
+        rtmp_frame_index_++;
+        return true;
+    }
+
+    if (!avformat_context_) {
+        return false;
+    }
+    AVFormatContext* fmt_ctx = (AVFormatContext*)avformat_context_;
+    if (fmt_ctx->nb_streams == 0) {
+        return false;
+    }
+    AVStream* stream = fmt_ctx->streams[0];
 
     // 构造 AVPacket 并发送
     AVPacket pkt = {};
