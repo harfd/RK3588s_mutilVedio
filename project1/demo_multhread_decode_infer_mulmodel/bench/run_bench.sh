@@ -36,9 +36,10 @@ WORKLOADS=(capped uncapped)
 # 1=编码照跑但不发网络(默认, 无需 RTMP 服务器且去网络噪声); 0=真实推流
 NULL_SINK="${NULL_SINK:-1}"
 
-REPS=5                 # 每 变体×工况 重复次数
-WARMUP_S=30            # 预热(丢弃)秒数
-WINDOW_S=120           # 稳态采样窗口秒数
+REPS="${REPS:-5}"              # 每 变体×工况 重复次数 (env 可覆盖)
+WARMUP_S="${WARMUP_S:-30}"     # 预热(丢弃)秒数 (env 可覆盖)
+WINDOW_S="${WINDOW_S:-120}"    # 稳态采样窗口秒数 (env 可覆盖)
+# 快速冒烟: REPS=1 WARMUP_S=10 WINDOW_S=30 sudo ./run_bench.sh
 TEMP_MAX_C=70          # 起跑温度上限(摄氏度), 高于此值先冷却
 COOLDOWN_MAX_S=180     # 冷却最长等待
 SAMPLE_INTERVAL=1      # 采样间隔(秒)
