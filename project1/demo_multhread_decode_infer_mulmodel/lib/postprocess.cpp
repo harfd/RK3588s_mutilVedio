@@ -88,9 +88,10 @@ float tensorValue(float value, int32_t, float)
 template <typename TensorType>
 int processHead(const TensorType *input, const int *anchor,
                 int grid_h, int grid_w, int stride,
-                std::vector<float> &boxes, std::vector<float> &scores,
-                std::vector<int> &class_ids, float threshold,
-                int32_t zero_point, float scale, int class_count)
+                 std::vector<float> &boxes, std::vector<float> &scores,
+                 std::vector<int> &class_ids, float threshold,
+                 int32_t zero_point, float scale, int class_count,
+                 const std::vector<std::string> &labels)
 {
     int valid_count = 0;
     const int grid_length = grid_h * grid_w;
@@ -110,11 +111,12 @@ int processHead(const TensorType *input, const int *anchor,
                 if (object_confidence < threshold)
                     continue;
 
-                int best_class = 0;
-                float best_class_probability =
-                    tensorValue(current[5 * grid_length], zero_point, scale);
-                for (int class_id = 1; class_id < class_count; ++class_id)
+                int best_class = -1;
+                float best_class_probability = -1.0f;
+                for (int class_id = 0; class_id < class_count; ++class_id)
                 {
+                    if (labels[class_id].empty())
+                        continue;
                     const float probability = tensorValue(
                         current[(5 + class_id) * grid_length],
                         zero_point, scale);
@@ -125,6 +127,8 @@ int processHead(const TensorType *input, const int *anchor,
                     }
                 }
 
+                if (best_class < 0)
+                    continue;
                 const float confidence =
                     object_confidence * best_class_probability;
                 // 保持原三模型流程的阈值语义：目标分数和类别分数分别过阈值。
@@ -170,6 +174,7 @@ int postProcessImpl(TensorType *input0, TensorType *input1, TensorType *input2,
 {
     if (!input0 || !input1 || !input2 || !group ||
         class_count < 1 || anchors.size() != 18 ||
+        labels.size() != static_cast<size_t>(class_count) ||
         zero_points.size() < 3 || quant_scales.size() < 3 ||
         scale_width <= 0.0f || scale_height <= 0.0f)
     {
@@ -191,7 +196,7 @@ int postProcessImpl(TensorType *input0, TensorType *input1, TensorType *input2,
             model_height / strides[head], model_width / strides[head],
             strides[head], boxes, scores, class_ids,
             confidence_threshold, zero_points[head], quant_scales[head],
-            class_count);
+            class_count, labels);
     }
     if (valid_count == 0)
         return 0;

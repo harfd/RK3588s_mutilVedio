@@ -5,9 +5,11 @@
 - `model/best-int8.rknn`：INT8 量化模型
 - `model/best-fp.rknn`：非量化模型
 
-程序会读取 `model/RK_anchors.txt` 的 18 个 anchor，以及
-`model/construction_ppe_labels_list.txt` 的 11 个类别。原有
-`config_user.ini` 三模型融合模式保持不变。
+程序会读取 `model/RK_anchors.txt` 的 18 个 anchor。当前 RKNN 模型本身
+仍是 11 类输出，通过配置中的 `class_ids=0,1,2,6` 只保留 `helmet`、
+`gloves`、`vest`、`Person` 四类；四个名称依次来自
+`model/construction_ppe_labels_list.txt`。原有 `config_user.ini`
+三模型融合模式保持不变。
 
 ## 1. 同步并运行 INT8
 
@@ -37,7 +39,7 @@ sudo ./build/myDemo config_ppe_int8.ini
 ```text
 RKNN model id=0 runtime=... driver=...
 RKNN output[0] ... type=INT8 ... qnt=AFFINE ...
-RKNN model id=0 postprocess=INT8 affine, heads=...
+RKNN model id=0 postprocess=INT8 affine, heads=..., enabled_classes=4/11
 PPE stream 0 detections=...
 ```
 
@@ -103,7 +105,8 @@ reconnect_interval_ms=1000
 ## 4. 判定结果
 
 - `rknn_init` 失败：先核对生成模型使用的 Toolkit2 与板端 Runtime/驱动兼容性。
-- `Cannot match YOLOv5 ... output`：模型类别数不是 11，或模型不是三检测头的
+- `Cannot match YOLOv5 ... output`：模型实际类别数与 `class_count` 不一致，
+  或模型不是三检测头的
   YOLOv5 原始输出结构；不要强行继续解码。
 - 能推理但始终 `detections=0`：先把 `confidence_threshold` 暂降到 `0.10`
   排查，再核对输入图片、类别顺序和模型本身。
@@ -111,5 +114,5 @@ reconnect_interval_ms=1000
 - INT8 与 FP 差异很大：扩大并重新平衡校准集，尤其增加小目标、遮挡、
   明暗变化和各类负样本。
 
-负类 `none`、`no_helmet`、`no_goggle`、`no_gloves`、`no_boots` 使用红框；
-其他 PPE 类使用绿框，`Person` 使用蓝色框。
+`helmet`、`gloves`、`vest` 使用绿框，`Person` 使用蓝色框。未列入
+`class_ids` 的其余七类不会进入候选框、NMS 或绘制结果。

@@ -70,14 +70,16 @@ public:
     rknn_lite(const std::string& model_name, int n, int class_num, int id,
               float box_conf_threshold, float nms_threshold,
               const std::string& label_path = "",
-              const std::string& anchor_path = "");
+              const std::string& anchor_path = "",
+              const std::vector<int>& class_ids = {});
     ~rknn_lite();
 };
 
 rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
                      int id, float box_conf_threshold, float nms_threshold,
                      const std::string& label_path,
-                     const std::string& anchor_path)
+                     const std::string& anchor_path,
+                     const std::vector<int>& class_ids)
 {
     this->class_num = class_num;
     model_id_ = id;
@@ -103,25 +105,49 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
         anchors_ = std::move(loaded_anchors);
     }
 
-    labels_.reserve(class_num);
     if (!label_path.empty())
     {
         std::ifstream label_file(label_path);
+        std::vector<std::string> loaded_labels;
         std::string label;
         while (std::getline(label_file, label))
         {
             if (!label.empty() && label.back() == '\r')
                 label.pop_back();
             if (!label.empty())
-                labels_.push_back(label);
+                loaded_labels.push_back(label);
         }
+        const size_t expected_label_count =
+            class_ids.empty() ? static_cast<size_t>(class_num)
+                              : class_ids.size();
         if (!label_file.eof() ||
-            labels_.size() != static_cast<size_t>(class_num))
+            loaded_labels.size() != expected_label_count)
         {
             fprintf(stderr,
-                    "Label file must contain exactly %d non-empty lines: %s\n",
-                    class_num, label_path.c_str());
+                    "Label file must contain exactly %zu non-empty lines: %s\n",
+                    expected_label_count, label_path.c_str());
             exit(-1);
+        }
+        if (class_ids.empty())
+        {
+            labels_ = std::move(loaded_labels);
+        }
+        else
+        {
+            labels_.assign(class_num, "");
+            for (size_t i = 0; i < class_ids.size(); ++i)
+            {
+                const int class_id = class_ids[i];
+                if (class_id < 0 || class_id >= class_num ||
+                    !labels_[class_id].empty())
+                {
+                    fprintf(stderr,
+                            "Invalid or duplicate enabled class id: %d\n",
+                            class_id);
+                    exit(-1);
+                }
+                labels_[class_id] = loaded_labels[i];
+            }
         }
     }
     else
@@ -283,10 +309,14 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
                get_qnt_type_string(attribute.qnt_type),
                attribute.zp, attribute.scale);
     }
-    printf("RKNN model id=%d postprocess=%s, heads=%d/%d/%d, labels=%zu\n",
+    const size_t enabled_class_count = std::count_if(
+        labels_.begin(), labels_.end(),
+        [](const std::string &label) { return !label.empty(); });
+    printf("RKNN model id=%d postprocess=%s, heads=%d/%d/%d, "
+           "enabled_classes=%zu/%d\n",
            id, quantized_outputs_ ? "INT8 affine" : "FP32",
            output_head_indices_[0], output_head_indices_[1],
-           output_head_indices_[2], labels_.size());
+           output_head_indices_[2], enabled_class_count, class_num);
 
     input_attrs[0].type = RKNN_TENSOR_UINT8;
     input_attrs[0].fmt = RKNN_TENSOR_NHWC;

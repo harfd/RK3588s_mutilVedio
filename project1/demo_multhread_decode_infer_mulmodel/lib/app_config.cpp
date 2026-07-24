@@ -98,6 +98,45 @@ bool get_int(const IniData& data, const std::string& section,
     }
 }
 
+bool get_int_list(const IniData& data, const std::string& section,
+                  const std::string& key, std::vector<int>& values,
+                  std::string& error) {
+    values.clear();
+    const std::string raw = get_string(data, section, key);
+    if (raw.empty()) {
+        return true;
+    }
+
+    std::stringstream input(raw);
+    std::string item;
+    while (std::getline(input, item, ',')) {
+        item = trim(item);
+        if (item.empty()) {
+            error = "invalid integer list: [" + section + "] " + key +
+                    "=" + raw;
+            return false;
+        }
+        try {
+            size_t parsed = 0;
+            const int value = std::stoi(item, &parsed);
+            if (parsed != item.size()) {
+                throw std::invalid_argument("trailing characters");
+            }
+            values.push_back(value);
+        } catch (...) {
+            error = "invalid integer list: [" + section + "] " + key +
+                    "=" + raw;
+            return false;
+        }
+    }
+    if (values.empty()) {
+        error = "invalid integer list: [" + section + "] " + key +
+                "=" + raw;
+        return false;
+    }
+    return true;
+}
+
 bool get_float(const IniData& data, const std::string& section,
                const std::string& key, float fallback, float& value,
                std::string& error) {
@@ -287,6 +326,10 @@ bool AppConfigLoader::load(const std::string& file_path, AppConfig& config,
                    inference.fusion_confidence_threshold, error)) {
         return false;
     }
+    if (!get_int_list(data, "inference", "class_ids",
+                      inference.class_ids, error)) {
+        return false;
+    }
     if (inference.core < 0 || inference.core > 2 ||
         inference.person_core < 0 || inference.person_core > 2 ||
         inference.helmet_core < 0 || inference.helmet_core > 2 ||
@@ -299,6 +342,19 @@ bool AppConfigLoader::load(const std::string& file_path, AppConfig& config,
         inference.callplay_class_count < 1) {
         error = "model class counts must be positive";
         return false;
+    }
+    for (size_t i = 0; i < inference.class_ids.size(); ++i) {
+        const int class_id = inference.class_ids[i];
+        if (class_id < 0 || class_id >= inference.class_count) {
+            error = "[inference] class_ids must be within model class_count";
+            return false;
+        }
+        if (std::find(inference.class_ids.begin(),
+                      inference.class_ids.begin() + i,
+                      class_id) != inference.class_ids.begin() + i) {
+            error = "[inference] class_ids must not contain duplicates";
+            return false;
+        }
     }
     if (!in_unit_interval(inference.confidence_threshold) ||
         !in_unit_interval(inference.nms_threshold) ||

@@ -677,7 +677,8 @@ int main(int argc, char* argv[])
                 app_config.inference.confidence_threshold,
                 app_config.inference.nms_threshold,
                 app_config.inference.label_path,
-                app_config.inference.anchor_path);
+                app_config.inference.anchor_path,
+                app_config.inference.class_ids);
             rknn_lite *model_ptr = model.get();
             rk_pool.push_back(std::move(model));
             rk_threads.emplace_back(
