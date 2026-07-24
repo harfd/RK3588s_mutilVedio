@@ -63,17 +63,26 @@ INT8 明显漏检，再回头调整校准集，而不是先改后处理。
 
 ## 3. 查看带框视频
 
-两份 PPE 配置默认关闭网络推流，避免板端因找不到服务器而启动失败。
-要看带框画面，编辑对应配置中的 `[streaming]`：
+两份 PPE 配置默认启用 RTMP，并向 WSL 中的 SRS 推送：
 
 ```ini
-rtmp_url=rtmp://你的服务器地址/live/ppe-int8
+rtmp_url=rtmp://192.168.2.3/live/livestream
 enable_rtmp=true
 draw_detections=true
 ```
 
-然后用 VLC、ffplay 或现有流媒体页面打开服务器输出。当前项目的 RTSP
-发送函数仍是占位实现，板端验证应使用 RTMP。
+必须先在 WSL 启动 SRS，再运行板端程序：
+
+```bash
+docker start srs
+ffplay -fflags nobuffer -flags low_delay -probesize 32 \
+  -analyzeduration 0 -framedrop \
+  rtmp://192.168.2.3/live/livestream
+```
+
+如果 WSL/宿主机地址变化，需要同时修改两份 PPE 配置。当前项目的 RTSP
+发送函数仍是占位实现，板端验证应使用 RTMP。若只想在终端检查检测结果，
+可将 `enable_rtmp` 临时改为 `false`。
 
 若要直接测试摄像头，把配置中的 `[stream.0]` 改为：
 
