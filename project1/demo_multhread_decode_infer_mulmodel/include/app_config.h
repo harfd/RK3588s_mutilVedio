@@ -31,6 +31,13 @@ struct GlobalAppConfig {
 };
 
 struct InferenceAppConfig {
+    // legacy_multi：原三模型融合；ppe_single：单个 11 类 PPE 模型。
+    std::string mode = "legacy_multi";
+    std::string model_path;
+    std::string label_path;
+    std::string anchor_path;
+    int core = 0;
+    int class_count = 11;
     std::string person_model_path;
     std::string helmet_model_path;
     std::string callplay_model_path;

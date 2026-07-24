@@ -10,8 +10,10 @@
 #define _rknnPool_H
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <queue>
 #include <vector>
@@ -56,23 +58,77 @@ private:
     rknn_tensor_mem *input_mem_ = nullptr;
     int model_id_ = -1;   // 基准埋点标签(模型角色: 0=person/1=helmet/3=callplay)
     int input_stride_ = 0;
+    bool quantized_outputs_ = false;
+    int output_head_indices_[3] = {-1, -1, -1};
+    std::vector<int> anchors_;
+    std::vector<std::string> labels_;
 
 public:
     Mat ori_img;
     void setInputFrame(const std::shared_ptr<DmaImageBuffer> &frame);
     int interf(detect_result_group_t &detect_result_group);
     rknn_lite(const std::string& model_name, int n, int class_num, int id,
-              float box_conf_threshold, float nms_threshold);
+              float box_conf_threshold, float nms_threshold,
+              const std::string& label_path = "",
+              const std::string& anchor_path = "");
     ~rknn_lite();
 };
 
 rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
-                     int id, float box_conf_threshold, float nms_threshold)
+                     int id, float box_conf_threshold, float nms_threshold,
+                     const std::string& label_path,
+                     const std::string& anchor_path)
 {
     this->class_num = class_num;
     model_id_ = id;
     box_conf_threshold_ = box_conf_threshold;
     nms_threshold_ = nms_threshold;
+    anchors_ = {
+        10, 13, 16, 30, 33, 23,
+        30, 61, 62, 45, 59, 119,
+        116, 90, 156, 198, 373, 326};
+    if (!anchor_path.empty())
+    {
+        std::ifstream anchor_file(anchor_path);
+        std::vector<int> loaded_anchors;
+        double value = 0.0;
+        while (anchor_file >> value)
+            loaded_anchors.push_back(static_cast<int>(std::lround(value)));
+        if (!anchor_file.eof() || loaded_anchors.size() != 18)
+        {
+            fprintf(stderr, "Anchor file must contain exactly 18 numbers: %s\n",
+                    anchor_path.c_str());
+            exit(-1);
+        }
+        anchors_ = std::move(loaded_anchors);
+    }
+
+    labels_.reserve(class_num);
+    if (!label_path.empty())
+    {
+        std::ifstream label_file(label_path);
+        std::string label;
+        while (std::getline(label_file, label))
+        {
+            if (!label.empty() && label.back() == '\r')
+                label.pop_back();
+            if (!label.empty())
+                labels_.push_back(label);
+        }
+        if (!label_file.eof() ||
+            labels_.size() != static_cast<size_t>(class_num))
+        {
+            fprintf(stderr,
+                    "Label file must contain exactly %d non-empty lines: %s\n",
+                    class_num, label_path.c_str());
+            exit(-1);
+        }
+    }
+    else
+    {
+        for (int class_id = 0; class_id < class_num; ++class_id)
+            labels_.push_back("class_" + std::to_string(class_id));
+    }
     /* Create the neural network */
     printf("Loading model id = %d\n", id);
     int model_data_size = 0;
@@ -111,6 +167,8 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
         printf("rknn_init error ret=%d\n", ret);
         exit(-1);
     }
+    printf("RKNN model id=%d runtime=%s driver=%s\n",
+           id, version.api_version, version.drv_version);
 
     // 获取模型的输入参数
     ret = rknn_query(rkModel, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
@@ -141,6 +199,11 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
     {
         output_attrs[i].index = i;
         ret = rknn_query(rkModel, RKNN_QUERY_OUTPUT_ATTR, &(output_attrs[i]), sizeof(rknn_tensor_attr));
+        if (ret < 0)
+        {
+            printf("rknn_query output attr error ret=%d\n", ret);
+            exit(-1);
+        }
     }
 
     // 设置输入参数
@@ -163,6 +226,68 @@ rknn_lite::rknn_lite(const std::string& model_name, int n, int class_num,
     }
 
     // 模型输入张量参数。
+    if (io_num.n_output < 3)
+    {
+        fprintf(stderr,
+                "RKNN model returned only %u output tensor(s), expected at least 3\n",
+                io_num.n_output);
+        exit(-1);
+    }
+
+    // 根据元素数量匹配 stride 8/16/32，避免导出器调整输出顺序后静默解码错误。
+    std::vector<bool> output_used(io_num.n_output, false);
+    const int strides[3] = {8, 16, 32};
+    for (int head = 0; head < 3; ++head)
+    {
+        const size_t expected_elements =
+            static_cast<size_t>(3 * (5 + class_num)) *
+            (height / strides[head]) * (width / strides[head]);
+        for (uint32_t output = 0; output < io_num.n_output; ++output)
+        {
+            if (!output_used[output] &&
+                output_attrs[output].n_elems == expected_elements)
+            {
+                output_head_indices_[head] = static_cast<int>(output);
+                output_used[output] = true;
+                break;
+            }
+        }
+        if (output_head_indices_[head] < 0)
+        {
+            fprintf(stderr,
+                    "Cannot match YOLOv5 stride-%d output: expected %zu elements "
+                    "for %d classes\n",
+                    strides[head], expected_elements, class_num);
+            exit(-1);
+        }
+    }
+
+    quantized_outputs_ = true;
+    for (int head = 0; head < 3; ++head)
+    {
+        const rknn_tensor_attr &attribute =
+            output_attrs[output_head_indices_[head]];
+        quantized_outputs_ =
+            quantized_outputs_ &&
+            attribute.type == RKNN_TENSOR_INT8 &&
+            attribute.qnt_type == RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC;
+    }
+    for (uint32_t output = 0; output < io_num.n_output; ++output)
+    {
+        const rknn_tensor_attr &attribute = output_attrs[output];
+        printf("RKNN output[%u] name=%s elems=%u type=%s fmt=%s qnt=%s "
+               "zp=%d scale=%g\n",
+               output, attribute.name, attribute.n_elems,
+               get_type_string(attribute.type),
+               get_format_string(attribute.fmt),
+               get_qnt_type_string(attribute.qnt_type),
+               attribute.zp, attribute.scale);
+    }
+    printf("RKNN model id=%d postprocess=%s, heads=%d/%d/%d, labels=%zu\n",
+           id, quantized_outputs_ ? "INT8 affine" : "FP32",
+           output_head_indices_[0], output_head_indices_[1],
+           output_head_indices_[2], labels_.size());
+
     input_attrs[0].type = RKNN_TENSOR_UINT8;
     input_attrs[0].fmt = RKNN_TENSOR_NHWC;
     input_attrs[0].pass_through = 0;
@@ -300,10 +425,13 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
 #endif
 
     // 设置输出
-    rknn_output outputs[io_num.n_output];
-    memset(outputs, 0, sizeof(outputs));
+    std::vector<rknn_output> outputs(io_num.n_output);
+    memset(outputs.data(), 0, sizeof(rknn_output) * outputs.size());
     for (uint32_t i = 0; i < io_num.n_output; i++)
-        outputs[i].want_float = 0; // 调用npu进行推演
+    {
+        outputs[i].index = i;
+        outputs[i].want_float = quantized_outputs_ ? 0 : 1;
+    }
     {
         BENCH_SCOPE("rknn_run", model_id_);   // T3: NPU 推理 (两变体应一致)
         ret = rknn_run(rkModel, NULL);
@@ -315,16 +443,18 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
     }
 
     // 获取npu的推演输出结果
-    ret = rknn_outputs_get(rkModel, io_num.n_output, outputs, NULL);
+    ret = rknn_outputs_get(rkModel, io_num.n_output, outputs.data(), NULL);
     if (ret < 0)
     {
         fprintf(stderr, "rknn_outputs_get failed ret=%d\n", ret);
         return -1;
     }
-    if (!outputs[0].buf || !outputs[1].buf || !outputs[2].buf)
+    if (!outputs[output_head_indices_[0]].buf ||
+        !outputs[output_head_indices_[1]].buf ||
+        !outputs[output_head_indices_[2]].buf)
     {
         fprintf(stderr, "rknn_outputs_get returned a null output buffer\n");
-        rknn_outputs_release(rkModel, io_num.n_output, outputs);
+        rknn_outputs_release(rkModel, io_num.n_output, outputs.data());
         return -1;
     }
 
@@ -333,19 +463,35 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group)
 
     std::vector<float> out_scales;
     std::vector<int32_t> out_zps;
-    for (uint32_t i = 0; i < io_num.n_output; ++i)
+    for (int head = 0; head < 3; ++head)
     {
-        out_scales.push_back(output_attrs[i].scale);
-        out_zps.push_back(output_attrs[i].zp);
+        const rknn_tensor_attr &attribute =
+            output_attrs[output_head_indices_[head]];
+        out_scales.push_back(attribute.scale);
+        out_zps.push_back(attribute.zp);
     }
 
-    const int postprocess_ret = post_process(
-        (int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf,
-        (int8_t *)outputs[2].buf, height, width,
-        box_conf_threshold_, nms_threshold_, scale_w, scale_h,
-        out_zps, out_scales, &detect_result_group, class_num);
+    const int output0 = output_head_indices_[0];
+    const int output1 = output_head_indices_[1];
+    const int output2 = output_head_indices_[2];
+    const int postprocess_ret =
+        quantized_outputs_
+            ? post_process(
+                  static_cast<int8_t *>(outputs[output0].buf),
+                  static_cast<int8_t *>(outputs[output1].buf),
+                  static_cast<int8_t *>(outputs[output2].buf),
+                  height, width, box_conf_threshold_, nms_threshold_,
+                  scale_w, scale_h, out_zps, out_scales,
+                  &detect_result_group, class_num, anchors_, labels_)
+            : post_process_float(
+                  static_cast<float *>(outputs[output0].buf),
+                  static_cast<float *>(outputs[output1].buf),
+                  static_cast<float *>(outputs[output2].buf),
+                  height, width, box_conf_threshold_, nms_threshold_,
+                  scale_w, scale_h, &detect_result_group, class_num,
+                  anchors_, labels_);
 
-    ret = rknn_outputs_release(rkModel, io_num.n_output, outputs);
+    ret = rknn_outputs_release(rkModel, io_num.n_output, outputs.data());
     if (postprocess_ret != 0)
     {
         fprintf(stderr, "RKNN post_process failed ret=%d\n", postprocess_ret);

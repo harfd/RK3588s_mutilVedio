@@ -226,20 +226,45 @@ bool AppConfigLoader::load(const std::string& file_path, AppConfig& config,
 
     const std::string base = config_directory(file_path);
     auto& inference = config.inference;
+    inference.mode = lower(
+        get_string(data, "inference", "mode", "legacy_multi"));
+    inference.model_path = resolve_path(
+        base, get_string(data, "inference", "model_path"));
+    inference.label_path = resolve_path(
+        base, get_string(data, "inference", "label_path"));
+    inference.anchor_path = resolve_path(
+        base, get_string(data, "inference", "anchor_path"));
     inference.person_model_path = resolve_path(
         base, get_string(data, "inference", "person_model_path"));
     inference.helmet_model_path = resolve_path(
         base, get_string(data, "inference", "helmet_model_path"));
     inference.callplay_model_path = resolve_path(
         base, get_string(data, "inference", "callplay_model_path"));
-    if (inference.person_model_path.empty() ||
-        inference.helmet_model_path.empty() ||
-        inference.callplay_model_path.empty()) {
-        error = "all three model paths are required in [inference]";
+    if (inference.mode != "legacy_multi" &&
+        inference.mode != "ppe_single") {
+        error = "[inference] mode must be legacy_multi or ppe_single";
         return false;
     }
-    if (!get_int(data, "inference", "person_core", 0,
-                 inference.person_core, error) ||
+    if (inference.mode == "ppe_single" &&
+        (inference.model_path.empty() ||
+         inference.label_path.empty() ||
+         inference.anchor_path.empty())) {
+        error = "model_path, label_path and anchor_path are required for ppe_single";
+        return false;
+    }
+    if (inference.mode == "legacy_multi" &&
+        (inference.person_model_path.empty() ||
+         inference.helmet_model_path.empty() ||
+         inference.callplay_model_path.empty())) {
+        error = "all three legacy model paths are required in [inference]";
+        return false;
+    }
+    if (!get_int(data, "inference", "core", 0,
+                 inference.core, error) ||
+        !get_int(data, "inference", "class_count", 11,
+                 inference.class_count, error) ||
+        !get_int(data, "inference", "person_core", 0,
+                  inference.person_core, error) ||
         !get_int(data, "inference", "helmet_core", 1,
                  inference.helmet_core, error) ||
         !get_int(data, "inference", "callplay_core", 2,
@@ -262,13 +287,15 @@ bool AppConfigLoader::load(const std::string& file_path, AppConfig& config,
                    inference.fusion_confidence_threshold, error)) {
         return false;
     }
-    if (inference.person_core < 0 || inference.person_core > 2 ||
+    if (inference.core < 0 || inference.core > 2 ||
+        inference.person_core < 0 || inference.person_core > 2 ||
         inference.helmet_core < 0 || inference.helmet_core > 2 ||
         inference.callplay_core < 0 || inference.callplay_core > 2) {
         error = "NPU core values must be 0, 1 or 2";
         return false;
     }
-    if (inference.person_class_count < 1 || inference.helmet_class_count < 1 ||
+    if (inference.class_count < 1 ||
+        inference.person_class_count < 1 || inference.helmet_class_count < 1 ||
         inference.callplay_class_count < 1) {
         error = "model class counts must be positive";
         return false;

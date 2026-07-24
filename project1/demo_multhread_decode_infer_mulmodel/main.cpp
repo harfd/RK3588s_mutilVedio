@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <iostream>
@@ -438,6 +439,124 @@ void rknn_infer(rknn_lite* person, rknn_lite* helmet, rknn_lite* tired,
     }
 }
 
+void drawPpeDetections(cv::Mat &frame,
+                       const detect_result_group_t &detections)
+{
+    for (int i = 0; i < detections.count; ++i)
+    {
+        const detect_result_t &result = detections.results[i];
+        const std::string name(result.name);
+        const bool warning =
+            name == "none" || name.find("no_") == 0;
+        const cv::Scalar color =
+            warning ? cv::Scalar(0, 0, 255)
+                    : (name == "Person" ? cv::Scalar(255, 128, 0)
+                                        : cv::Scalar(0, 255, 0));
+        cv::rectangle(
+            frame, cv::Point(result.box.left, result.box.top),
+            cv::Point(result.box.right, result.box.bottom), color, 2);
+
+        char text[64];
+        std::snprintf(text, sizeof(text), "%s %.2f",
+                      result.name, result.prop);
+        cv::putText(
+            frame, text,
+            cv::Point(result.box.left, std::max(18, result.box.top - 6)),
+            cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 2);
+    }
+}
+
+void rknn_infer_ppe(rknn_lite *model, int stream_index,
+                    int infer_interval, bool draw_detections)
+{
+    detect_result_group_t latest_results;
+    memset(&latest_results, 0, sizeof(latest_results));
+    int frame_count = 0;
+    int inference_count = 0;
+    bool has_inference_result = false;
+    bool first_input_logged = false;
+    bool first_output_logged = false;
+    uint64_t last_sequence = 0;
+
+    while (!manager.stream_loaders[stream_index]->stopFlag)
+    {
+        auto &stream_buffer = manager.stream_loaders[stream_index]->buffer;
+        std::shared_ptr<DmaImageBuffer> source_frame;
+        uint64_t sequence = 0;
+        {
+            std::lock_guard<std::mutex> lock(stream_buffer.mtx);
+            sequence = stream_buffer.sequence;
+            if (sequence != last_sequence)
+                source_frame = stream_buffer.dma_frame;
+        }
+        if (!source_frame)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        last_sequence = sequence;
+        model->setInputFrame(source_frame);
+
+        if (!first_input_logged)
+        {
+            std::cout << "PPE stream " << stream_index
+                      << " received first frame: "
+                      << source_frame->width() << "x"
+                      << source_frame->height() << std::endl;
+            first_input_logged = true;
+        }
+
+        ++frame_count;
+        const bool do_infer =
+            !has_inference_result ||
+            ((frame_count - 1) % infer_interval == 0);
+        if (do_infer)
+        {
+            memset(&latest_results, 0, sizeof(latest_results));
+            if (model->interf(latest_results) != 0)
+            {
+                std::cerr << "PPE RKNN inference failed on stream "
+                          << stream_index << std::endl;
+                continue;
+            }
+            has_inference_result = true;
+            ++inference_count;
+            if (inference_count == 1 || inference_count % 30 == 0)
+            {
+                std::cout << "PPE stream " << stream_index
+                          << " detections=" << latest_results.count;
+                for (int i = 0; i < latest_results.count; ++i)
+                {
+                    std::cout << " [" << latest_results.results[i].name
+                              << " "
+                              << latest_results.results[i].prop << "]";
+                }
+                std::cout << std::endl;
+            }
+        }
+
+        if (draw_detections)
+        {
+            if (!source_frame->syncForCpu())
+                continue;
+            drawPpeDetections(model->ori_img, latest_results);
+        }
+        if (!source_frame->syncForDevice())
+            continue;
+        {
+            std::lock_guard<std::mutex> image_lock(mutexes[stream_index]);
+            images[stream_index] = source_frame;
+        }
+
+        if (!first_output_logged)
+        {
+            std::cout << "PPE stream " << stream_index
+                      << " published first frame to compositor" << std::endl;
+            first_output_logged = true;
+        }
+    }
+}
+
 int main(int argc, char* argv[])
 {
     bench_init();
@@ -544,35 +663,55 @@ int main(int argc, char* argv[])
             return -1;
         }
 
-        auto person = std::make_unique<rknn_lite>(
-            app_config.inference.person_model_path,
-            app_config.inference.person_core,
-            app_config.inference.person_class_count, 0,
-            app_config.inference.confidence_threshold,
-            app_config.inference.nms_threshold);
-        auto helmet = std::make_unique<rknn_lite>(
-            app_config.inference.helmet_model_path,
-            app_config.inference.helmet_core,
-            app_config.inference.helmet_class_count, 1,
-            app_config.inference.confidence_threshold,
-            app_config.inference.nms_threshold);
-        auto callplay = std::make_unique<rknn_lite>(
-            app_config.inference.callplay_model_path,
-            app_config.inference.callplay_core,
-            app_config.inference.callplay_class_count, 3,
-            app_config.inference.confidence_threshold,
-            app_config.inference.nms_threshold);
+        if (app_config.inference.mode == "ppe_single")
+        {
+            auto model = std::make_unique<rknn_lite>(
+                app_config.inference.model_path,
+                app_config.inference.core,
+                app_config.inference.class_count, 0,
+                app_config.inference.confidence_threshold,
+                app_config.inference.nms_threshold,
+                app_config.inference.label_path,
+                app_config.inference.anchor_path);
+            rknn_lite *model_ptr = model.get();
+            rk_pool.push_back(std::move(model));
+            rk_threads.emplace_back(
+                rknn_infer_ppe, model_ptr, i,
+                app_config.global.infer_interval,
+                app_config.streaming.draw_detections);
+        }
+        else
+        {
+            auto person = std::make_unique<rknn_lite>(
+                app_config.inference.person_model_path,
+                app_config.inference.person_core,
+                app_config.inference.person_class_count, 0,
+                app_config.inference.confidence_threshold,
+                app_config.inference.nms_threshold);
+            auto helmet = std::make_unique<rknn_lite>(
+                app_config.inference.helmet_model_path,
+                app_config.inference.helmet_core,
+                app_config.inference.helmet_class_count, 1,
+                app_config.inference.confidence_threshold,
+                app_config.inference.nms_threshold);
+            auto callplay = std::make_unique<rknn_lite>(
+                app_config.inference.callplay_model_path,
+                app_config.inference.callplay_core,
+                app_config.inference.callplay_class_count, 3,
+                app_config.inference.confidence_threshold,
+                app_config.inference.nms_threshold);
 
-        rknn_lite* person_ptr = person.get();
-        rknn_lite* helmet_ptr = helmet.get();
-        rknn_lite* callplay_ptr = callplay.get();
-        rk_pool.push_back(std::move(person));
-        rk_pool.push_back(std::move(helmet));
-        rk_pool.push_back(std::move(callplay));
-        rk_threads.emplace_back(
-            rknn_infer, person_ptr, helmet_ptr, nullptr, callplay_ptr, i,
-            app_config.global.infer_interval,
-            app_config.streaming.draw_detections);
+            rknn_lite* person_ptr = person.get();
+            rknn_lite* helmet_ptr = helmet.get();
+            rknn_lite* callplay_ptr = callplay.get();
+            rk_pool.push_back(std::move(person));
+            rk_pool.push_back(std::move(helmet));
+            rk_pool.push_back(std::move(callplay));
+            rk_threads.emplace_back(
+                rknn_infer, person_ptr, helmet_ptr, nullptr, callplay_ptr, i,
+                app_config.global.infer_interval,
+                app_config.streaming.draw_detections);
+        }
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
