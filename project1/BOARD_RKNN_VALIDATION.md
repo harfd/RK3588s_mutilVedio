@@ -41,8 +41,9 @@ RKNN model id=0 postprocess=INT8 affine, heads=...
 PPE stream 0 detections=...
 ```
 
-程序默认读取 `project1/1.mp4` 并循环运行，每 30 次推理输出一次类别和
-置信度。按 `Ctrl+C` 停止。
+程序默认加载 `project1/1.mp4`～`4.mp4` 和板载摄像头共五路输入并循环
+运行。五个 RKNN 上下文按 NPU 核心 `0/1/2/0/1` 轮转，每路每 30 次推理
+输出一次类别和置信度。按 `Ctrl+C` 停止。
 
 ## 2. 运行非量化模型作基准
 

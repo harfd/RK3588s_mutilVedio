@@ -665,9 +665,14 @@ int main(int argc, char* argv[])
 
         if (app_config.inference.mode == "ppe_single")
         {
+            // 多路单模型上下文轮转到三个 NPU 核心，避免五路全部占用 core 0。
+            const int ppe_core =
+                (app_config.inference.core + i) % 3;
+            std::cout << "PPE stream " << i
+                      << " uses NPU core " << ppe_core << std::endl;
             auto model = std::make_unique<rknn_lite>(
                 app_config.inference.model_path,
-                app_config.inference.core,
+                ppe_core,
                 app_config.inference.class_count, 0,
                 app_config.inference.confidence_threshold,
                 app_config.inference.nms_threshold,
